@@ -1,0 +1,137 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_DB: pulse
+    ports:
+      - "5432:5432"
+    volumes:
+      - pulse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./backend
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-me
+      CORS_ORIGINS: http://localhost:3000
+      COOKIE_SECURE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Internal housekeeping only (worker heartbeat sync, cron dispatch).
+  # Kept off the job-execution queues so a burst of user jobs can never
+  # delay heartbeat sync or schedule dispatch.
+  worker-internal:
+    build: ./backend
+    command: celery -A app.celery_app worker -Q pulse.internal --loglevel=info --concurrency=2 --hostname=worker-internal@%h
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-me
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Dedicated pool per priority tier (see app/priority.py) so a flood of
+  # low-priority jobs can never starve high-priority ones — real isolation,
+  # not just a routing hint, since Redis-backed Celery has no native
+  # per-task priority ordering.
+  worker-high:
+    build: ./backend
+    command: celery -A app.celery_app worker -Q pulse.high --loglevel=info --concurrency=4 --hostname=worker-high@%h
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-me
+    depends_on:
+      - worker-internal
+
+  worker-normal:
+    build: ./backend
+    command: celery -A app.celery_app worker -Q pulse.normal --loglevel=info --concurrency=4 --hostname=worker-normal@%h
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-me
+    depends_on:
+      - worker-internal
+
+  worker-low:
+    build: ./backend
+    command: celery -A app.celery_app worker -Q pulse.low --loglevel=info --concurrency=2 --hostname=worker-low@%h
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-me
+    depends_on:
+      - worker-internal
+
+  beat:
+    build: ./backend
+    command: celery -A app.celery_app beat --loglevel=info
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-me
+    depends_on:
+      - api
+
+  flower:
+    build: ./backend
+    command: celery -A app.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - worker-internal
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  pulse_pgdata:
