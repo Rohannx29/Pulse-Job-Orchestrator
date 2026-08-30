@@ -10,27 +10,9 @@ The key design principle is:
 
 ## 2. High-level architecture
 
-```mermaid
-flowchart LR
-    UI[Next.js Dashboard] -->|HTTP + httpOnly cookies| API[FastAPI REST API]
-    API -->|CRUD / transactions| PG[(PostgreSQL)]
-    API -->|dispatch / coordination| R[(Redis)]
+![Pulse system architecture](diagrams/architecture.png)
 
-    R --> HI[High Worker Pool\npulse.high]
-    R --> NO[Normal Worker Pool\npulse.normal]
-    R --> LO[Low Worker Pool\npulse.low]
-    R --> IN[Internal Worker Pool\npulse.internal]
-
-    BEAT[Celery Beat] -->|cron dispatch + heartbeat sync| IN
-    HI -->|execution + logs| PG
-    NO -->|execution + logs| PG
-    LO -->|execution + logs| PG
-    IN -->|housekeeping state| PG
-    HI -->|lease acquire/release| R
-    NO -->|lease acquire/release| R
-    LO -->|lease acquire/release| R
-    FLOWER[Flower] -.->|inspect/events| R
-```
+*Request flow, data stores, and the priority-tier worker fleet. Rendered from the source topology described below — regenerate from `docs/diagrams/` if the component graph changes.*
 
 ## 3. Components
 

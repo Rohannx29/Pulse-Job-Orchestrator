@@ -33,7 +33,8 @@
 23. [Cron dispatch locking](#23-cron-dispatch-locking)
 24. [Global worker visibility](#24-global-worker-visibility)
 25. [At-least-once execution semantics](#25-at-least-once-execution-semantics)
-26. [Known trade-offs and intentionally deferred scope](#26-known-trade-offs-and-intentionally-deferred-scope)
+26. [JWT verification test hardening: a base64 boundary edge case](#26-jwt-verification-test-hardening-a-base64-boundary-edge-case)
+27. [Known trade-offs and intentionally deferred scope](#27-known-trade-offs-and-intentionally-deferred-scope)
 
 ---
 
@@ -1105,15 +1106,46 @@ For example, an HTTP payment request should carry an idempotency key understood 
 
 ---
 
-## 26. Known trade-offs and intentionally deferred scope
+## 26. JWT verification test hardening: a base64 boundary edge case
+
+### Problem discovered
+
+`test_jwt_rejects_tampered_token` failed intermittently in full-suite runs while passing consistently in isolation.
+
+A first investigation ran a 200,000-iteration fuzz test of the original tampering method (`token[:-2] + "xx"`) and found zero collisions, then reran the full suite 13 times with no further failures. That was treated as sufficient evidence, and the test was changed to guarantee the tampered string differed from the original token.
+
+The failure recurred after that change.
+
+### Root cause
+
+A 32-byte HMAC-SHA256 signature base64url-encodes to 43 characters. 256 bits is not a multiple of 6, so the signature's last character carries only 4 meaningful bits; the remaining 2 bits are discarded on decode.
+
+Several distinct base64 characters at that final position decode to identical underlying bytes. Tampering only the last character — even a version guaranteed to change the string — was never guaranteed to change the bytes signature verification actually checks.
+
+### Decision
+
+The test now tampers a character 5 positions from the end, inside the segment where every character's full 6 bits are significant.
+
+### Verification
+
+- 50,000-iteration fuzz test of the corrected tampering method: 0 failures.
+- 20 consecutive full-suite runs: all passed.
+
+### Lesson
+
+A hypothesis supported by evidence is not a proven one. The first diagnosis ("environmental flake") was consistent with everything gathered at the time and still wrong. Only treating the second failure as new information, rather than noise around an already-accepted conclusion, surfaced the actual defect.
+
+---
+
+## 27. Known trade-offs and intentionally deferred scope
 
 The following are intentionally not presented as solved features.
 
-### 26.1 JWT storage / frontend authentication hardening
+### 27.1 JWT storage / frontend authentication hardening
 
 The current implementation should be treated according to the actual repository authentication flow. Any future authentication change must keep the README and design document synchronized with the code rather than describing a planned state as implemented.
 
-### 26.2 Coarse priority tiers
+### 27.2 Coarse priority tiers
 
 Pulse deliberately uses:
 
@@ -1127,7 +1159,7 @@ instead of pretending to provide strict numeric ordering.
 
 This gives a real, verifiable capacity-isolation guarantee.
 
-### 26.3 Single dependency per job
+### 27.3 Single dependency per job
 
 The current schema supports:
 
@@ -1139,11 +1171,11 @@ not arbitrary fan-in.
 
 Multiple dependencies would require a join table and a completion predicate over all parents.
 
-### 26.4 Rate limiting
+### 27.4 Rate limiting
 
 API rate limiting is a production-hardening item, particularly for authentication and externally exposed endpoints.
 
-### 26.5 RBAC
+### 27.5 RBAC
 
 The current organization model is intentionally simple. Role-based permissions such as:
 
@@ -1155,11 +1187,11 @@ viewer
 
 are future scope.
 
-### 26.6 Audit log
+### 27.6 Audit log
 
 `JobExecution` provides job execution history, but sensitive control-plane actions such as queue pause/resume, manual DLQ retry, and schedule toggling would benefit from a dedicated audit log.
 
-### 26.7 Observability
+### 27.7 Observability
 
 Future production hardening should include:
 
@@ -1170,7 +1202,7 @@ Future production hardening should include:
 - worker utilization;
 - job latency and retry metrics.
 
-### 26.8 Production deployment hardening
+### 27.8 Production deployment hardening
 
 The Docker Compose setup is a development/demo environment. Production deployment should add:
 
@@ -1221,3 +1253,4 @@ The decisions above follow a few recurring principles:
 8. **Prefer one shared execution path over multiple subtly different paths.**
 9. **Fix race conditions at the ordering/ownership boundary rather than adding arbitrary sleeps.**
 10. **Treat migrations, security boundaries, and operational behavior as part of the feature—not as cleanup after implementation.**
+11. **Treat early supporting evidence for a diagnosis as a hypothesis, not a conclusion — a second failure is new information, not noise.**

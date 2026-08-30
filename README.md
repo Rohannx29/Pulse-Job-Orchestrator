@@ -22,34 +22,7 @@ A useful job system has to answer more than "was a message placed on a queue?" P
 
 ## Architecture at a glance
 
-```mermaid
-flowchart LR
-    UI["Next.js Dashboard"] -->|HTTP + httpOnly cookies| API["FastAPI REST API"]
-
-    API -->|CRUD / system state| DB[("PostgreSQL\nSystem of Record")]
-    API -->|dispatch / coordination| REDIS[("Redis\nCelery Broker + Coordination")]
-
-    subgraph EXEC["Celery Worker Fleet"]
-        HIGH["pulse.high\nHigh Priority"]
-        NORMAL["pulse.normal\nNormal Priority"]
-        LOW["pulse.low\nLow Priority"]
-        INTERNAL["pulse.internal\nHousekeeping"]
-    end
-
-    REDIS -->|routed jobs| HIGH
-    REDIS -->|routed jobs| NORMAL
-    REDIS -->|routed jobs| LOW
-    REDIS -->|internal tasks| INTERNAL
-
-    HIGH -->|execution + logs| DB
-    NORMAL -->|execution + logs| DB
-    LOW -->|execution + logs| DB
-    INTERNAL -->|heartbeats + schedules| DB
-    INTERNAL -->|spawn scheduled jobs| REDIS
-
-    BEAT["Celery Beat"] -->|periodic tasks| REDIS
-    FLOWER["Flower"] -.->|Celery events| REDIS
-```
+![Pulse system architecture](docs/diagrams/architecture.png)
 
 **Execution model:** PostgreSQL is the durable source of truth; Redis carries Celery work and coordination state; the API chooses the priority tier; dedicated worker pools provide real high/normal/low isolation; Beat feeds housekeeping tasks; and recurring schedules create ordinary Pulse jobs before they enter the normal execution pipeline.
 
@@ -123,10 +96,13 @@ pulse/
     ├── architecture.md
     ├── design-decisions.md
     ├── er-diagram.md
-    └── Pulse_Technical_Documentation.docx
+    ├── Pulse-Technical-Documentation.docx
+    └── diagrams/                   # rendered PNGs referenced by the markdown docs above
+        ├── architecture.png
+        └── er-diagram.png
 ```
 
-The documentation set is intentionally limited to these four files under `docs/`; the technical documentation is the fifth submission artifact when the root `README.md` is included.
+The documentation set is intentionally limited to these four documents under `docs/` (plus the rendered diagram images they reference); the technical documentation is the fifth submission artifact when the root `README.md` is included.
 
 ## Quick start — Docker
 
@@ -418,7 +394,7 @@ The submission documentation is intentionally small:
 | `docs/architecture.md` | System components and execution flow |
 | `docs/design-decisions.md` | Important engineering decisions and trade-offs |
 | `docs/er-diagram.md` | Current database/entity model |
-| `docs/Pulse_Technical_Documentation.docx` | Formal submission document |
+| `docs/Pulse-Technical-Documentation.docx` | Formal submission document |
 
 ## Editing the documentation safely
 
@@ -428,7 +404,7 @@ When the implementation changes, update documentation in this order:
 2. **architecture.md** — update components or request/execution flow when service boundaries change.
 3. **design-decisions.md** — add or revise a decision only when the implementation introduces a meaningful architectural trade-off.
 4. **er-diagram.md** — update whenever models, relationships, fields, or constraints change.
-5. **Pulse_Technical_Documentation.docx** — update the formal document last, using the four source documents and the code as the authority.
+5. **Pulse-Technical-Documentation.docx** — update the formal document last, using the four source documents and the code as the authority.
 
 Do not describe a planned feature as implemented. If a guarantee is conditional, state the condition explicitly.
 

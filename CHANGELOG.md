@@ -11,7 +11,8 @@ All notable changes to **Pulse** after the initial scaffold, grouped by implemen
 - [Phase 1 — Correctness Gaps](#phase-1--correctness-gaps-complete)
 - [Phase 2 — Reliability & Operations](#phase-2--reliability--operations-in-progress)
 - [External Audit Response](#external-audit-response)
-- [Phase 3 — Cookie + Refresh-Token Authentication](#phase-a--cookie--refresh-token-auth-partial)
+- [Phase 3 — Cookie + Refresh-Token Authentication](#phase-3--cookie--refresh-token-authentication--partial)
+- [Phase 4 — Test Suite Verification Hardening](#phase-4--test-suite-verification-hardening)
 - [Verification Summary](#verification-summary)
 
 ---
@@ -942,6 +943,43 @@ After the authentication merge:
 
 ---
 
+# Phase 4 — Test Suite Verification Hardening
+
+## Fixed
+
+### JWT tampering test failed intermittently — a real base64 boundary edge case
+
+**Problem**
+
+`test_jwt_rejects_tampered_token` failed intermittently in full-suite runs while passing consistently in isolation.
+
+A first investigation ran a 200,000-iteration fuzz test of the original tampering method:
+
+```python
+token[:-2] + "xx"
+```
+
+Zero collisions were found, and 13 consecutive full-suite reruns passed cleanly. That was treated as sufficient evidence, and the test was changed to guarantee the tampered string differed from the original rather than relying on a literal that might coincidentally match.
+
+The failure recurred after that change.
+
+**Root cause**
+
+A 32-byte HMAC-SHA256 signature base64url-encodes to 43 characters. 256 bits is not a multiple of 6, so the signature's last character carries only 4 meaningful bits; the remaining 2 bits are discarded on decode.
+
+Several distinct base64 characters at that final position decode to identical underlying bytes. Tampering only the last character — even a version guaranteed to change the string — was never guaranteed to change the bytes signature verification actually checks.
+
+**Fix**
+
+The test now tampers a character 5 positions from the end, inside the segment where every character's full 6 bits are significant.
+
+**Verification**
+
+- 50,000-iteration fuzz test of the corrected method: 0 failures
+- 20 consecutive full-suite runs: all passed
+
+---
+
 # Verification Summary
 
 | Area | Verification recorded |
@@ -965,6 +1003,7 @@ After the authentication merge:
 | Authentication | Real PostgreSQL register/login/refresh/replay/logout flow |
 | Authentication tests | 31/31 after auth merge |
 | Security authorization | Cross-org schedule access returns 404 |
+| JWT tamper test | Root cause found: base64 boundary bit truncation; fixed and fuzz-verified |
 
 ---
 
@@ -995,5 +1034,8 @@ The changes above reflect several recurring engineering lessons:
 
 8. **Documentation should distinguish verified behavior from intended behavior.**  
    Features and guarantees should only be described as implemented when they have been validated against the actual system.
+
+9. **Early supporting evidence for a diagnosis is not proof of it.**  
+   A fuzz test and 13 clean reruns supported "environmental flake" and were still wrong. The fix only happened because a second failure was treated as new information rather than noise around an already-accepted conclusion.
 
 ---
