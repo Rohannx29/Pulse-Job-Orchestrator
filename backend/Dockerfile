@@ -1,7 +1,7 @@
 # Multi-stage hardened production Dockerfile for Pulse Backend & Workers
 
 # Stage 1: Build dependencies & compile binary wheels
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /build
 
@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Stage 2: Minimal unprivileged runtime image
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 WORKDIR /app
 
