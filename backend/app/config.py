@@ -52,6 +52,18 @@ class Settings:
     REFRESH_TOKEN_COOKIE_NAME: str = "pulse_refresh_token"
     COOKIE_SECURE: bool = os.getenv("COOKIE_SECURE", "false").lower() == "true"
     COOKIE_SAMESITE: str = os.getenv("COOKIE_SAMESITE", "lax")
+    COOKIE_DOMAIN: str | None = os.getenv("COOKIE_DOMAIN")
+
+    # Trusted reverse proxies for client IP evaluation (X-Forwarded-For)
+    TRUSTED_PROXIES: list[str] = [
+        p.strip()
+        for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16").split(",")
+        if p.strip()
+    ]
+
+    # Metrics endpoint protection
+    METRICS_TOKEN: str | None = os.getenv("METRICS_TOKEN")
+    METRICS_PROTECT: bool = os.getenv("METRICS_PROTECT", "false").lower() == "true"
 
 
 settings = Settings()

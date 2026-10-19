@@ -18,16 +18,49 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from app.database import SessionLocal
+from unittest.mock import patch
+
+from app.config import settings
+from app.database import SessionLocal, engine
 from app.main import app
 from app.models import Organization, RefreshToken, User
 from app.security import hash_password
 
 
+def is_postgres_available():
+    try:
+        with engine.connect() as conn:
+            return True
+    except Exception:
+        return False
+
+
+def is_redis_available():
+    try:
+        import redis
+        r = redis.from_url(settings.REDIS_URL)
+        r.ping()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not is_postgres_available(),
+    reason="PostgreSQL is not reachable (requires running Postgres database)",
+)
+
+
 @pytest.fixture
 def client():
-    with TestClient(app) as test_client:
-        yield test_client
+    headers = {"Origin": "http://testserver"}
+    if not is_redis_available():
+        with patch("app.rate_limiter.check_rate_limit", return_value=(True, 100, 60)):
+            with TestClient(app, headers=headers) as test_client:
+                yield test_client
+    else:
+        with TestClient(app, headers=headers) as test_client:
+            yield test_client
 
 
 @pytest.fixture

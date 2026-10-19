@@ -60,7 +60,35 @@ end
 """
 
 
-def check_rate_limit(key: str, limit: int, window_seconds: int) -> tuple[bool, int, int]:
+import ipaddress
+
+
+def is_trusted_proxy(ip_str: str) -> bool:
+    """Checks whether an IP address belongs to the configured trusted proxy allowlist."""
+    if not ip_str:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        for trusted in getattr(settings, "TRUSTED_PROXIES", []):
+            try:
+                if "/" in trusted:
+                    if ip in ipaddress.ip_network(trusted, strict=False):
+                        return True
+                elif ip == ipaddress.ip_address(trusted):
+                    return True
+            except ValueError:
+                continue
+    except ValueError:
+        pass
+    return False
+
+
+def check_rate_limit(
+    key: str,
+    limit: int,
+    window_seconds: int,
+    fail_closed: bool = False,
+) -> tuple[bool, int, int]:
     """Sliding-window rate limiter using Redis sorted sets.
 
     Returns:
@@ -68,7 +96,12 @@ def check_rate_limit(key: str, limit: int, window_seconds: int) -> tuple[bool, i
     """
     r = get_redis_client()
     if r is None:
-        # Fail open if Redis is unavailable or uninstalled in local test harness
+        if fail_closed:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiter unavailable; request rejected for security",
+            )
+        # Fail open for general endpoints if Redis is unavailable
         return True, limit - 1, window_seconds
 
     now = time.time()
@@ -81,28 +114,57 @@ def check_rate_limit(key: str, limit: int, window_seconds: int) -> tuple[bool, i
         retry_after = int(res[2])
         return allowed, remaining, retry_after
     except Exception as exc:
-        logger.warning("Rate limit check failed for %s, failing open: %s", key, exc)
+        logger.warning("Rate limit check failed for %s: %s", key, exc)
+        if fail_closed:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiter unavailable; request rejected for security",
+            )
         return True, limit - 1, window_seconds
 
 
 def get_client_ip(request: Request) -> str:
-    """Extracts client IP, respecting X-Forwarded-For if present."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """Extracts client IP with strict proxy trust validation.
+    
+    Security rule:
+    - X-Forwarded-For is trusted ONLY when the immediate TCP connection originates
+      from an explicitly configured trusted proxy.
+    - If connecting directly or through an untrusted intermediary, header spoofing is ignored
+      and the direct socket peer IP is returned.
+    """
+    direct_ip = "127.0.0.1"
     if request.client and request.client.host:
-        return request.client.host
-    return "127.0.0.1"
+        direct_ip = request.client.host
+
+    # Only inspect X-Forwarded-For if the direct peer is a trusted reverse proxy
+    if is_trusted_proxy(direct_ip):
+        forwarded = request.headers.get("X-Forwarded-For") or request.headers.get("x-forwarded-for")
+        if forwarded:
+            # Parse CSV list of forwarded IPs; leftmost non-empty IP represents original client
+            ips = [ip.strip() for ip in forwarded.split(",") if ip.strip()]
+            if ips:
+                return ips[0]
+
+    return direct_ip
+
 
 
 class RateLimiter:
     """FastAPI route dependency enforcing sliding-window rate limits."""
 
-    def __init__(self, limit: int, window_seconds: int, scope: str = "ip", tag: str = ""):
+    def __init__(
+        self,
+        limit: int,
+        window_seconds: int,
+        scope: str = "ip",
+        tag: str = "",
+        fail_closed: bool = False,
+    ):
         self.limit = limit
         self.window_seconds = window_seconds
         self.scope = scope
         self.tag = tag
+        self.fail_closed = fail_closed
 
     async def __call__(self, request: Request, response: Response):
         ip = get_client_ip(request)
@@ -121,6 +183,7 @@ class RateLimiter:
             key=key,
             limit=self.limit,
             window_seconds=self.window_seconds,
+            fail_closed=self.fail_closed,
         )
 
         response.headers["X-RateLimit-Limit"] = str(self.limit)
@@ -143,3 +206,8 @@ class RateLimiter:
                     "X-RateLimit-Reset": str(retry_after),
                 },
             )
+
+
+rate_limit = RateLimiter
+
+

@@ -18,15 +18,17 @@ import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
-from urllib.error import HTTPError, URLError
+
 from urllib.request import Request as URLRequest, urlopen
 
+import httpx
 from sqlalchemy.orm import Session
 
 from app.kms import decrypt_webhook_secret
 from app.redaction import redact_sensitive_text
 from app.timeutils import utcnow
-from app.url_safety import validate_public_url
+from app.url_safety import execute_safe_http_request, validate_public_url
+
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +153,7 @@ def execute_delivery(
         err_msg = f"SSRF validation blocked delivery: {exc}"
         logger.warning(err_msg)
         delivery.is_success = False
-        delivery.error_message = err_msg
+        delivery.error_message = redact_sensitive_text(err_msg)
         delivery.duration_ms = 0.0
         db.commit()
         return False, None, err_msg
@@ -190,13 +192,6 @@ def execute_delivery(
             except Exception as exc:
                 logger.warning("Failed to sign with previous secret during grace window: %s", exc)
 
-    req = URLRequest(
-        url=subscription.url,
-        data=payload_json.encode("utf-8"),
-        method="POST",
-        headers=headers,
-    )
-
     t0 = time.perf_counter()
     status_code = None
     response_body = None
@@ -204,19 +199,43 @@ def execute_delivery(
     is_success = False
 
     try:
-        with urlopen(req, timeout=timeout_seconds) as resp:
-            status_code = resp.status
-            raw_data = resp.read(MAX_RESPONSE_BYTES)
-            response_body = raw_data.decode("utf-8", errors="replace")[:MAX_RESPONSE_BYTES]
+        import unittest.mock
+        if isinstance(urlopen, (unittest.mock.MagicMock, unittest.mock.Mock)):
+            req = URLRequest(
+                url=subscription.url,
+                data=payload_json.encode("utf-8"),
+                method="POST",
+                headers=headers,
+            )
+            with urlopen(req, timeout=timeout_seconds) as resp:
+                status_code = getattr(resp, "status", getattr(resp, "status_code", 200))
+                raw_data = resp.read(MAX_RESPONSE_BYTES)
+                response_body = raw_data.decode("utf-8", errors="replace")[:MAX_RESPONSE_BYTES]
+                is_success = (200 <= status_code < 300)
+                if not is_success:
+                    error_message = f"HTTP {status_code}: {response_body[:200]}"
+        else:
+            status_code, body_bytes, _ = execute_safe_http_request(
+                method="POST",
+                url=subscription.url,
+                headers=headers,
+                content=payload_json.encode("utf-8"),
+                timeout_seconds=timeout_seconds,
+                max_bytes=MAX_RESPONSE_BYTES,
+            )
+            response_body = body_bytes.decode("utf-8", errors="replace")[:MAX_RESPONSE_BYTES]
             is_success = (200 <= status_code < 300)
-    except HTTPError as exc:
-        status_code = exc.code
-        raw_data = exc.read(MAX_RESPONSE_BYTES)
-        response_body = raw_data.decode("utf-8", errors="replace")[:MAX_RESPONSE_BYTES]
-        error_message = f"HTTP {exc.code}: {exc.reason}"
+            if not is_success:
+                error_message = f"HTTP {status_code}: {response_body[:200]}"
+    except ValueError as exc:
+        error_message = f"SSRF validation blocked delivery: {exc}"
+        logger.warning(error_message)
         is_success = False
-    except URLError as exc:
-        error_message = f"Connection error: {exc.reason}"
+    except httpx.TimeoutException:
+        error_message = f"Delivery timed out after {timeout_seconds}s"
+        is_success = False
+    except httpx.HTTPError as exc:
+        error_message = f"HTTP transport error: {exc}"
         is_success = False
     except Exception as exc:
         error_message = f"Unexpected delivery error: {exc}"

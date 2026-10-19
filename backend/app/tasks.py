@@ -73,20 +73,16 @@ def _handle_http_request(payload: dict[str, Any]) -> dict[str, Any]:
     goes through the same retry/backoff/DLQ path as any other failure.
 
     A caller-supplied URL making a server-side request is a classic SSRF
-    surface, so this validates against private/internal address space
-    before connecting (see app/url_safety.py), restricts to a safe method
-    allowlist, caps the timeout regardless of what's requested, never
-    follows redirects (an unvalidated redirect target would reintroduce
-    the exact thing being blocked), and caps how much response body it
-    will read into memory."""
-    import httpx
-
-    from app.url_safety import validate_public_url
+    surface, so this executes through defense-in-depth execute_safe_http_request:
+    validates against private/internal/metadata address space before connecting,
+    restricts to a safe method allowlist, caps the timeout regardless of what's
+    requested, strictly disables unvalidated redirects (follow_redirects=False),
+    and enforces bounded response body read limits."""
+    from app.url_safety import execute_safe_http_request
 
     if "url" not in payload:
         raise ValueError("http_request job payload requires a 'url' field")
     url = payload["url"]
-    validate_public_url(url)
 
     method = payload.get("method", "GET").upper()
     if method not in ALLOWED_HTTP_METHODS:
@@ -94,31 +90,27 @@ def _handle_http_request(payload: dict[str, Any]) -> dict[str, Any]:
 
     timeout = min(float(payload.get("timeout_seconds", 10)), MAX_HTTP_TIMEOUT_SECONDS)
 
-    with httpx.stream(
-        method,
-        url,
-        json=payload.get("body"),
+    body_obj = payload.get("body")
+    json_data = body_obj if isinstance(body_obj, (dict, list)) else None
+    content = body_obj.encode("utf-8") if isinstance(body_obj, str) else None
+
+    status_code, content_bytes, _ = execute_safe_http_request(
+        method=method,
+        url=url,
         headers=payload.get("headers", {}),
-        timeout=timeout,
-        follow_redirects=False,
-    ) as resp:
-        chunks = []
-        total = 0
-        for chunk in resp.iter_bytes():
-            total += len(chunk)
-            if total > MAX_HTTP_RESPONSE_BYTES:
-                raise RuntimeError(f"Response from {url} exceeded {MAX_HTTP_RESPONSE_BYTES}-byte limit")
-            chunks.append(chunk)
-        content = b"".join(chunks)
-        status_code = resp.status_code
+        json_data=json_data,
+        content=content,
+        timeout_seconds=timeout,
+        max_bytes=MAX_HTTP_RESPONSE_BYTES,
+    )
 
     if status_code >= 400:
-        raise RuntimeError(f"HTTP {status_code} from {url}: {content[:300]!r}")
+        raise RuntimeError(f"HTTP {status_code} from {url}: {content_bytes[:300]!r}")
 
     try:
-        body = json.loads(content)
+        body = json.loads(content_bytes)
     except ValueError:
-        body = content[:2000].decode("utf-8", errors="replace")
+        body = content_bytes[:2000].decode("utf-8", errors="replace")
     return {"status_code": status_code, "body": body}
 
 

@@ -1640,6 +1640,41 @@ Pulse introduces durable transaction-safe event publication and race-free dispat
 
 ---
 
+## 41. Network and session security hardening, query-string JWT removal, single-use SSE connection tickets, trusted proxy client IP identity, defense-in-depth SSRF, and CSRF protection
+
+### Decision
+
+Pulse introduces multi-layer perimeter, session, and network security hardening:
+1. **Query-String JWT Elimination & Single-Use SSE Tickets (`app.deps`, `app.routers.auth`, `app.routers.events`)**:
+   - Query-string authentication (`?token=...`) is strictly removed from all general REST APIs and `GET /events`. All authenticated endpoints exclusively verify `pulse_access_token` httpOnly cookies.
+   - For environments or non-browser consumers requiring Server-Sent Events (SSE) where custom cookie headers cannot be transmitted via native `EventSource`, the API introduces `POST /auth/sse-ticket`. The endpoint issues a single-use connection ticket (`sset_...`) valid for 60 seconds.
+   - Upon connecting to `GET /events?ticket=sset_...`, the backend atomically reads and destroys the ticket via Redis `GETDEL` (falling back to atomic in-memory ticket cache during local testing). The ticket cannot be reused, cannot authenticate any REST API, and prevents token persistence in query logs or browser history.
+2. **Client IP Identification & Trusted Proxy Boundary (`app.rate_limiter`)**:
+   - The rate limiter and audit logging systems evaluate client IP addresses with strict reverse-proxy trust validation.
+   - `X-Forwarded-For` and `X-Real-IP` headers are parsed *only* when the direct socket TCP peer matches the configured `TRUSTED_PROXIES` allowlist (e.g. Kubernetes ingress controllers or load balancers).
+   - If connecting directly or through an untrusted intermediary, header spoofing is ignored and the socket peer IP is used.
+   - Sensitive endpoints (`/auth/login`, `/auth/register`, `/auth/accept-invite`) utilize `fail_closed=True`. In the event of a Redis cluster outage, these endpoints return `503 Service Unavailable`, rejecting authentication requests to prevent brute force or denial of rate limiting during security monitoring blackouts.
+3. **Defense-in-Depth SSRF HTTP Client (`app.url_safety`)**:
+   - Replaces naive pre-flight DNS lookups with an integrated, defense-in-depth HTTP transport client (`app.url_safety.execute_safe_http_request`).
+   - Resolves all candidate IPv4 and IPv6 addresses, blocking private RFC 1918 networks, loopback addresses (`127.0.0.0/8`, `::1`), link-local and cloud metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`), multicast, and IPv4-mapped IPv6 embeddings (`::ffff:127.0.0.1`).
+   - Strictly enforces `follow_redirects=False` on outbound webhook deliveries and HTTP jobs to eliminate redirect-based SSRF bypasses.
+   - Enforces bounded connect (5s), read (10s), write (5s), and pool (5s) timeouts, and bounds response payloads to 1MB.
+4. **Browser/API Topology & CSRF Protection Middleware (`app.csrf`)**:
+   - Production browser topology establishes same-origin proxying via Next.js `rewrites()` (`/api/:path*` -> FastAPI backend).
+   - Cross-origin browser requests are protected by `CSRFProtectionMiddleware`, intercepting all state-modifying HTTP methods (`POST`, `PUT`, `PATCH`, `DELETE`) carrying browser cookie authentication.
+   - The middleware asserts that the request `Origin` or `Referer` header matches the validated `CORS_ORIGINS` whitelist, returning `403 Forbidden` on mismatch or absence.
+5. **Private Monitoring Infrastructure & /metrics Protection (`app.routers.health`)**:
+   - The Prometheus telemetry endpoint (`GET /metrics`) is isolated from public exposition. When `METRICS_PROTECT=true` is enabled, scraping is restricted strictly to internal cluster CIDRs and requires Bearer token authorization via `METRICS_TOKEN`.
+
+### Why
+
+1. **Token Leakage Elimination**: Query-string JWTs leak into proxy access logs, browser history, analytics scripts, and `Referer` headers when external links are followed. Enforcing httpOnly cookies and single-use 60-second SSE tickets eliminates token capture risks while retaining real-time push capabilities.
+2. **Preventing Rate-Limiter Spoofing & Fail-Open Blindspots**: Malicious clients routinely inject spoofed `X-Forwarded-For: 1.2.3.4` headers to bypass IP-based rate limiting or poison audit logs. Trusting proxy headers only from verified internal intermediaries eliminates spoofing. Failing closed on login routes guarantees that a Redis outage does not leave credential endpoints unprotected against distributed brute-force attacks.
+3. **Elimination of DNS Rebinding & Redirect SSRF Exploits**: Separate DNS validation before `requests.get()` is vulnerable to Time-Of-Check to Time-Of-Use (TOCTOU) DNS rebinding and HTTP redirects to internal cloud metadata IP addresses (`169.254.169.254`). An integrated client validating all resolved IP addresses, forbidding redirects, and bounding payload and socket timeouts provides true defense in depth.
+4. **Defense Against Cross-Site Request Forgery (CSRF)**: While modern browsers default to `SameSite=Lax`, subdomains, top-level navigations, or legacy clients can permit cross-site state-modifying requests. Enforcing strict `Origin`/`Referer` whitelisting across all cookie-bearing mutations prevents CSRF attacks.
+
+---
+
 ## Decision summary
 
 | Area | Chosen approach | Main reason |
@@ -1672,6 +1707,7 @@ Pulse introduces durable transaction-safe event publication and race-free dispat
 | Webhook secret hardening & KMS | AES-128 KMS encryption at rest + dual-signing rotation grace + delivery redaction + Org-Admin RBAC | Prevents key compromise, zero-downtime rotation, and protects delivery payload confidentiality |
 | Centralized invitations | Shared domain service `create_organization_invite` | Guarantees identical audit event format and single-use token lifecycle |
 | Transactional outbox & race elimination | Durable `outbox_events` + row locking + atomic conditional update join resolution + occurrence uniqueness | Eliminates ghost dispatches, fan-in duplicate runs, and cron double ticks under concurrency |
+| Network & session security | Query-string JWT removal + single-use SSE tickets + trusted proxy IP + fail-closed auth + defense-in-depth SSRF + CSRF middleware | Prevents token logging leaks, proxy IP spoofing, DNS rebinding, cross-origin forgery, and monitoring exposure |
 | CI/CD & multi-arch delivery | GitHub Actions + ephemeral services + Buildx QEMU | Automated verification across PostgreSQL 16 & Redis 7 with AMD64/ARM64 container images |
 | End-to-end browser testing | Playwright + isolated browser contexts + Next.js webServer | Real browser verification of auth cookies, queue controls, DAG graphs, and webhooks |
 

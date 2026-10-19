@@ -711,4 +711,69 @@ Every test spec provisions an isolated tenant organization and operator account 
 - **Outbound Webhooks**: Verifies secret generation (`whsec_...`), interactive masking/revealing controls, manual test ping execution, and delivery audit drawer expansion.
 - **Audit Logs Explorer**: Asserts that immutable administrative mutations appear in real-time with actor attribution, verifying action and resource type dropdown filters.
 
+## 24. Network and session security architecture
+
+Pulse establishes defense-in-depth network, session, and perimeter security boundaries across browser, API, Celery, and monitoring ingress:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                      Browser / Client                       │
+│    (Same-Origin /api Proxying or Explicit CORS Origins)     │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                Cookies: pulse_access_token
+                Headers: Origin / Referer
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 CSRF Protection Middleware                  │
+│   (Validates Origin/Referer on POST/PUT/PATCH/DELETE)       │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                Rate Limiter & Trusted Proxy                 │
+│  - Inspects X-Forwarded-For ONLY from TRUSTED_PROXIES       │
+│  - Fail-Closed rejection (HTTP 503) on Redis auth outage    │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Authentication Boundary                   │
+│  - Strict httpOnly cookies; query-string JWT rejected       │
+│  - Single-Use 60s SSE Tickets (POST /auth/sse-ticket)       │
+│    Atomic consumption via Redis GETDEL                      │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│               Defense-in-Depth SSRF Transport               │
+│  - Validates all IPv4/IPv6 addresses (RFC1918, metadata,    │
+│    loopback, IPv4-mapped IPv6 ::ffff:... blocked)           │
+│  - Follow redirects = False                                 │
+│  - Bounded connect (5s), read (10s), payload (1MB)          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 24.1 Strict cookie authentication & single-use SSE connection tickets
+- **Query-String JWT Removal**: To eliminate access token leakage into access logs, browser history, reverse proxy logs, and `Referer` headers, query-string authentication (`?token=...`) is strictly rejected across all API endpoints.
+- **Single-Use SSE Tickets**: Because standard browser `EventSource` interfaces do not permit custom HTTP headers, real-time event streaming utilizes short-lived connection tickets (`POST /auth/sse-ticket`). The API issues a single-use token (`sset_...`) valid for 60 seconds. When the client initiates `GET /events?ticket=sset_...`, the backend atomically consumes and invalidates the ticket via Redis `GETDEL` (with in-memory fallback), authenticating the tenant session. The ticket cannot be reused or used to access general REST APIs.
+
+### 24.2 Client IP identification & trusted reverse proxy topology
+- **Spoofing Defense**: The API enforces strict reverse proxy trust rules: `X-Forwarded-For` is parsed *only* when the direct TCP peer matches the configured `TRUSTED_PROXIES` allowlist (e.g., Kubernetes Ingress, AWS ALB, Cloudflare). If a direct connection or untrusted intermediary presents a spoofed header, it is ignored and the socket peer IP is used.
+- **Fail-Closed Auth Rate Limiting**: Sensitive endpoints (`/auth/login`, `/auth/register`, `/auth/accept-invite`) utilize `fail_closed=True`. In the event of a Redis cluster outage or network partition, these endpoints reject requests with `503 Service Unavailable`, preventing brute-force attacks during monitoring blackouts.
+
+### 24.3 Defense-in-depth SSRF protection transport
+Pulse replaces naive pre-flight DNS lookups with an integrated, defense-in-depth HTTP transport client (`app.url_safety.execute_safe_http_request`):
+- **Address Space Validation**: Resolves all candidate IPv4 and IPv6 addresses, blocking private RFC 1918 networks, loopback addresses (`127.0.0.0/8`, `::1`), link-local and cloud metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`), multicast, and IPv4-mapped IPv6 embeddings (`::ffff:127.0.0.1`).
+- **Redirects Forbidden**: Outbound webhook deliveries and HTTP job handlers strictly set `follow_redirects=False`. This eliminates redirect-based SSRF bypasses where a public endpoint redirects to an internal cloud metadata target.
+- **Resource Bounds**: Enforces strict timeout limits (5s connect, 10s read, 5s write, 5s pool) and caps inbound and outbound payload sizes at 1MB (2KB for webhook logs).
+
+### 24.4 Browser/API topology & CSRF protection
+- **Same-Origin Proxying**: The Next.js dashboard uses Next.js `rewrites()` in `frontend/next.config.js` to proxy `/api/:path*` directly to the FastAPI backend, establishing same-origin operational semantics.
+- **CSRF Protection Middleware**: For cross-origin configurations, `CSRFProtectionMiddleware` intercepts all state-modifying HTTP methods (`POST`, `PUT`, `PATCH`, `DELETE`) carrying browser cookie authentication. It asserts that the request `Origin` or `Referer` header matches the validated `CORS_ORIGINS` whitelist, returning `403 Forbidden` on mismatch or absence.
+
+### 24.5 Private monitoring infrastructure & /metrics protection
+- The Prometheus telemetry endpoint (`GET /metrics`) is isolated from public exposition. Production deployments can enable `METRICS_PROTECT=true` to restrict scraping strictly to internal cluster CIDRs and require Bearer token authorization via `METRICS_TOKEN`.
+
 

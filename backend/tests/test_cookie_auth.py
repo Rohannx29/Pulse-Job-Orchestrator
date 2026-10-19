@@ -39,9 +39,12 @@ def client():
     def override_get_db():
         yield db
 
+    from unittest.mock import patch
+
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
-        yield test_client
+    with patch("app.rate_limiter.check_rate_limit", return_value=(True, 10, 60)):
+        with TestClient(app) as test_client:
+            yield test_client
     app.dependency_overrides.clear()
 
 

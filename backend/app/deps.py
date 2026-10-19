@@ -6,6 +6,9 @@ from app.config import settings
 from app.models import OrgMemberRole, Organization, OrganizationMember, User, UserRole
 from app.security import decode_access_token
 
+# In-memory ticket cache fallback for local/test environments when Redis is not running
+_LOCAL_TICKET_CACHE: dict[str, tuple[str, float]] = {}
+
 
 def get_current_user(
     request: Request, db: Session = Depends(get_db)
@@ -15,7 +18,7 @@ def get_current_user(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Cookie"},
     )
-    token = request.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME) or request.query_params.get("token")
+    token = request.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME)
     if token is None:
         raise credentials_exception
     user_id = decode_access_token(token)

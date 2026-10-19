@@ -62,6 +62,7 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Data retention & table pruning | ✅ | Automated Celery Beat batch pruning (`pulse.internal`) & admin trigger (`POST /admin/prune`) for heartbeats, logs, executions, and terminal jobs |
 | Outbound Webhooks & Secret Hardening | ✅ | Cryptographic HMAC-SHA256 (`whsec_...`), KMS encryption at rest (Fernet), dual-signing rotation grace window, automatic delivery redaction, SSRF protection, Celery delivery worker (`pulse.internal`), and strict Org-Admin RBAC boundary |
 | Transactional Outbox & Race-Free Dispatch | ✅ | Atomic PostgreSQL transactional outbox (`outbox_events`), row-level locked claiming (`SKIP LOCKED`), idempotent publisher with retry bounds, atomic conditional DAG fan-in unblocking, and unique `(schedule_id, scheduled_fire_time)` occurrence deduplication |
+| Network & Session Security | ✅ | Query-string JWT completely removed in favor of httpOnly cookies, short-lived single-use SSE connection tickets (`POST /auth/sse-ticket`), trusted proxy IP validation (`X-Forwarded-For`), fail-closed auth rate limiting on Redis outage, defense-in-depth SSRF client (custom resolver, IP validation, redirects forbidden, 1MB payload caps), CSRF protection middleware, and private `/metrics` authorization |
 | CI/CD & Multi-Arch Container Builds | ✅ | GitHub Actions workflow with PostgreSQL 16 & Redis 7 service containers, Ruff linting, coverage reporting, Next.js build verification, Docker Compose smoke tests, and Buildx multi-arch images (`linux/amd64`, `linux/arm64`) |
 | End-to-End Testing (Playwright) | ✅ | Automated browser test suite covering registration, auth lifecycle, project/queue management, multi-parent DAG workflow inspection, outbound webhooks, and audit logs |
 
@@ -105,6 +106,7 @@ pulse/
 │   │   ├── webhooks.py        # Outbound webhook signing, SSRF validation & delivery engine
 │   │   ├── dag.py             # Multi-parent DAG engine, DFS cycle detection & join resolution
 │   │   ├── rate_limiter.py    # Redis sliding-window rate limiter
+│   │   ├── csrf.py            # CSRF protection middleware for state-modifying requests
 │   │   ├── auth_hardening.py  # account lockout and brute-force defenses
 │   │   ├── logging_config.py  # structured JSON logging & correlation IDs
 │   │   ├── metrics.py         # Prometheus metrics registry, gauges & collectors
@@ -352,7 +354,7 @@ celery -A app.celery_app beat --loglevel=info
 
 ## Testing
 
-The backend test suite contains **84 test cases across 17 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, cookie authentication, security, URL safety, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, and retention pruning. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
+The backend test suite contains **99 test cases across 20 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, transactional outbox race prevention, schedule deduplication, cookie authentication, network security, SSRF defense in depth, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, and retention pruning. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
 
 Run backend tests:
 
@@ -364,6 +366,8 @@ python -m pytest tests/ -v
 Targeted test suites:
 
 ```bash
+python -m pytest tests/test_network_security.py -v
+python -m pytest tests/test_outbox_concurrency.py -v
 python -m pytest tests/test_webhook_rbac.py -v
 python -m pytest tests/test_webhooks.py -v
 python -m pytest tests/test_dag.py -v
@@ -377,17 +381,21 @@ Integration tests require the dependencies specified by the project and, where a
 
 Pulse currently provides:
 
-- password hashing
-- httpOnly cookie-based access/refresh authentication
-- refresh-token hashing at rest
-- refresh-token rotation and family-based reuse detection
+- password hashing (Argon2 / bcrypt)
+- httpOnly cookie-based access/refresh authentication (query-string JWT rejected across all APIs)
+- short-lived, single-use SSE connection tickets (`POST /auth/sse-ticket`) with atomic consumption
+- refresh-token hashing at rest and family-based reuse detection
 - role-based access control (System Admin, Org Admin, Member)
 - single-use, hashed invite tokens for team onboarding
-- explicit CORS origin configuration
-- organization-scoped resource authorization
-- 404 responses for cross-organization resource access
-- SSRF-aware HTTP URL validation
-- method, timeout, response-size, and redirect restrictions for HTTP jobs
+- explicit CORS origin and same-origin `/api` Next.js reverse proxy configuration
+- Cross-Site Request Forgery (CSRF) protection middleware on state-modifying requests bearing cookies
+- trusted proxy client IP extraction preventing `X-Forwarded-For` header spoofing
+- fail-closed sliding-window rate limiting on sensitive endpoints (`/auth/login`, `/auth/register`) during Redis outages
+- defense-in-depth SSRF HTTP client (IPv4/IPv6 address validation, cloud metadata blocking, disabled redirects, bounded timeouts and capped 1MB payloads)
+- KMS secret encryption at rest (Fernet AES-128) for outbound webhook secrets with non-destructive rotation grace windows
+- automatic delivery log sanitization and credential redaction
+- organization-scoped resource authorization with 404 responses for cross-tenant access
+- private `/metrics` protection via private network restriction and Bearer tokens
 
 The HTTP handler is hardened against common private/loopback/link-local targets, but DNS rebinding is a deeper network-level problem. Production deployment should add egress controls or a dedicated proxy.
 

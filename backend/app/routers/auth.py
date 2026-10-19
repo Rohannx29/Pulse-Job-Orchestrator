@@ -1,9 +1,13 @@
+import logging
 import uuid
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
 
 from app.config import settings
 from app.timeutils import utcnow
@@ -47,6 +51,7 @@ def _set_auth_cookies(response: Response, user_id: str, refresh_token: str) -> N
         httponly=True,
         secure=settings.COOKIE_SECURE,
         samesite=settings.COOKIE_SAMESITE,
+        domain=settings.COOKIE_DOMAIN,
         path="/",
     )
     response.set_cookie(
@@ -56,6 +61,7 @@ def _set_auth_cookies(response: Response, user_id: str, refresh_token: str) -> N
         httponly=True,
         secure=settings.COOKIE_SECURE,
         samesite=settings.COOKIE_SAMESITE,
+        domain=settings.COOKIE_DOMAIN,
         path="/auth",
     )
 
@@ -66,6 +72,7 @@ def _clear_auth_cookies(response: Response) -> None:
         httponly=True,
         secure=settings.COOKIE_SECURE,
         samesite=settings.COOKIE_SAMESITE,
+        domain=settings.COOKIE_DOMAIN,
         path="/",
     )
     response.delete_cookie(
@@ -73,6 +80,7 @@ def _clear_auth_cookies(response: Response) -> None:
         httponly=True,
         secure=settings.COOKIE_SECURE,
         samesite=settings.COOKIE_SAMESITE,
+        domain=settings.COOKIE_DOMAIN,
         path="/auth",
     )
 
@@ -94,7 +102,7 @@ def _create_refresh_token_record(db: Session, user_id: str, family_id: str | Non
     "/register",
     response_model=UserOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RateLimiter(limit=10, window_seconds=300, tag="auth:register"))],
+    dependencies=[Depends(RateLimiter(limit=10, window_seconds=300, tag="auth:register", fail_closed=True))],
 )
 def register(payload: UserCreate, db: Session = Depends(get_db)):
     """Open registration — creates a user + organization.
@@ -136,7 +144,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
 @router.post(
     "/login",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(RateLimiter(limit=15, window_seconds=60, tag="auth:login"))],
+    dependencies=[Depends(RateLimiter(limit=15, window_seconds=60, tag="auth:login", fail_closed=True))],
 )
 def login(
     response: Response,
@@ -215,6 +223,33 @@ def me(user: User = Depends(get_current_user)):
     return user
 
 
+@router.post("/sse-ticket", summary="Generate short-lived single-use SSE connection ticket")
+def create_sse_ticket(user: User = Depends(get_current_user)):
+    """Generates a short-lived, single-use connection ticket for non-browser SSE clients.
+
+    - Lifetime: 60 seconds.
+    - Single-use: Atomically deleted upon connection handshake.
+    - Scoped: Only validates connection to GET /events; CANNOT authenticate general API endpoints.
+    - Prevents leaking credentials in query strings or access logs.
+    """
+    import secrets
+    import time
+    from app.deps import _LOCAL_TICKET_CACHE
+
+    ticket = f"sset_{secrets.token_urlsafe(32)}"
+    ttl_seconds = 60
+
+    try:
+        import redis
+        r = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        r.set(f"pulse:sse_ticket:{ticket}", user.id, ex=ttl_seconds)
+    except Exception as exc:
+        logger.warning("Redis unavailable for SSE ticket storage, using local cache: %s", exc)
+        _LOCAL_TICKET_CACHE[ticket] = (user.id, time.time() + ttl_seconds)
+
+    return {"ticket": ticket, "expires_in": ttl_seconds}
+
+
 # ---------------------------------------------------------------------------
 # Invite flow — org admins invite new members; invitees accept via token
 # ---------------------------------------------------------------------------
@@ -245,7 +280,7 @@ def invite_member(
     "/accept-invite",
     response_model=UserOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RateLimiter(limit=15, window_seconds=300, tag="auth:accept-invite"))],
+    dependencies=[Depends(RateLimiter(limit=15, window_seconds=300, tag="auth:accept-invite", fail_closed=True))],
 )
 def accept_invite(
     payload: AcceptInviteRequest,

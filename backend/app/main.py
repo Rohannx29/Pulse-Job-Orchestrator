@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.csrf import CSRFProtectionMiddleware
 from app.logging_config import CorrelationIdMiddleware, setup_logging
 from app.routers import admin, audit, auth, dlq, events, health, jobs, orgs, projects, queues, schedules, webhooks, workers
 
@@ -16,6 +17,7 @@ if settings.LOG_FORMAT == "json":
 app = FastAPI(title="Pulse", description="Distributed job scheduling & orchestration API", version="0.1.0")
 
 app.add_middleware(CorrelationIdMiddleware)
+app.add_middleware(CSRFProtectionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
