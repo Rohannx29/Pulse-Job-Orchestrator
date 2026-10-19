@@ -20,7 +20,7 @@ The key design principle is:
 
 The frontend provides the operator-facing interface for authentication, queue/job exploration, queue statistics, and job details.
 
-It communicates with the FastAPI API and relies on browser cookies for authentication rather than storing access tokens in JavaScript-accessible storage.
+It communicates with the FastAPI API, relies on browser cookies for authentication rather than storing access tokens in JavaScript-accessible storage, and subscribes to the Server-Sent Events (SSE) stream (`GET /events`) to render job state transitions and queue mutations live with zero-latency.
 
 ### 3.2 FastAPI API
 
@@ -32,7 +32,9 @@ The API is the application boundary. It:
 - creates and updates durable PostgreSQL state;
 - maps job priority to a Celery queue;
 - dispatches jobs after the durable state required by the worker exists;
-- exposes operational and execution data to the dashboard.
+- exposes operational and execution data to the dashboard;
+- streams real-time updates over Server-Sent Events (SSE) scoped by tenant organization;
+- enforces sliding-window rate limits and brute-force defenses across API routes.
 
 Important modules include:
 
@@ -40,37 +42,45 @@ Important modules include:
 app/main.py
 app/routers/*.py
 app/dispatch.py
+app/events.py
+app/rate_limiter.py
+app/auth_hardening.py
 app/schemas.py
 app/deps.py
 app/security.py
+app/audit.py
+app/logging_config.py
 ```
 
 ### 3.3 PostgreSQL
 
 PostgreSQL is the **system of record** for durable state, including:
 
-- users and refresh-token sessions;
-- organizations and projects;
+- users, roles, and refresh-token sessions;
+- organizations, members, and single-use invitations;
 - queues and retry policies;
 - schedules;
 - jobs;
 - execution attempts and logs;
 - workers and heartbeats;
-- current dead-letter state.
+- current dead-letter state;
+- audit log records for operator actions and resource mutations.
 
 Schema changes are managed through Alembic migrations. The application does not silently create the schema with `create_all()` at startup.
 
 ### 3.4 Redis
 
-Redis has two roles:
+Redis has three roles:
 
 1. Celery broker/result-backend infrastructure.
 2. Backing store for Pulse's custom short-lived coordination primitives.
+3. High-throughput message broker for tenant-scoped real-time event streaming (Pub/Sub).
 
-The custom primitives are:
+The custom coordination primitives are:
 
 - per-queue concurrency leases using a sorted set and atomic Lua operations;
-- a short-lived cron-dispatch mutex.
+- a short-lived cron-dispatch mutex;
+- sliding-window rate limiter counters and account lockout locks.
 
 ### 3.5 Celery worker pools
 
@@ -244,6 +254,8 @@ Resource lookups enforce that hierarchy. A resource belonging to another organiz
 
 Browser authentication uses httpOnly cookies. Refresh tokens are stored as hashes in PostgreSQL and rotated through token families.
 
+Sensitive control-plane actions (queue pause/resume/edit, job manual retries, member invitations and removals, role modifications, and schedule toggling) are recorded into an append-only `AuditLog` table. Each audit entry records the tenant `org_id`, actor `user_id`, action verb, target resource type and ID, and metadata diff in `details` (JSONB), enabling complete compliance tracking across tenant boundaries.
+
 ## 11. Execution semantics
 
 Pulse provides **at-least-once execution semantics**.
@@ -261,12 +273,201 @@ Therefore:
 The most important boundaries are:
 
 ```text
-FastAPI       → durable application state + authorization
+FastAPI       → durable application state + authorization + SSE streaming
 PostgreSQL    → durable state/history
-Redis/Celery  → task delivery + short-lived coordination
-Workers       → actual job execution
-Next.js       → operator experience
+Redis/Celery  → task delivery + coordination + Pub/Sub events
+Workers       → actual job execution + event emission
+Next.js       → operator experience + real-time reactive UI
 Flower        → Celery-level observation
 ```
 
 This keeps the scheduler's domain logic explicit without reimplementing the reliable task-delivery machinery already provided by Celery/Redis.
+
+## 13. Real-time live updates (Server-Sent Events & Redis Pub/Sub)
+
+Pulse uses Server-Sent Events (SSE) backed by Redis Pub/Sub to provide real-time updates without polling:
+
+```text
+Worker / API Action
+        ↓
+publish_event(org_id, event_name, payload)
+        ↓
+Redis Pub/Sub: pulse:events:{org_id}
+        ↓
+FastAPI SSE endpoint: GET /events (aioredis stream)
+        ↓
+Next.js useEvents hook (native browser EventSource)
+        ↓
+Instant UI badge, count, and status update
+```
+
+### Key properties
+
+- **Unidirectional simplicity**: Dashboard observability is strictly server-to-client; SSE uses standard HTTP without the protocol upgrade, framing overhead, and bidirectional state maintenance of WebSockets.
+- **Tenant isolation**: Normal users and organization administrators subscribe strictly to their own organization's channel `pulse:events:{org_id}`. Platform `system_admin` users can monitor `pulse:events:global` or filter to specific tenants.
+- **Graceful degradation**: In the event of a network disruption or proxy timeout, the client automatically reconnects with exponential backoff. Periodic keepalive pings (`: keepalive\n\n`) prevent proxy timeouts.
+- **Resilience**: Redis Pub/Sub publication failures in background workers or API routers are non-blocking and caught safely, ensuring event publishing never disrupts primary job execution or database transactions.
+
+## 14. API rate limiting and authentication hardening
+
+To protect multi-tenant infrastructure against denial-of-service, noisy neighbors, and credential-stuffing brute-force attacks, Pulse enforces layered protections:
+
+### 14.1 Sliding-window rate limiting
+
+Rate limits are evaluated using Redis sorted sets (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD`) within an atomic Lua script:
+
+- **Auth endpoints**: `/auth/login` (15 req/min per IP), `/auth/register` (10 req/5min per IP), `/auth/accept-invite` (15 req/5min per IP).
+- **Tenant job quotas**: `POST /jobs` (120 req/min per tenant organization), preventing a single tenant from starving shared scheduler resources.
+- **Retry quotas**: `POST /jobs/{id}/retry` (30 req/min per organization).
+- **Standard headers**: RFC-compliant `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` headers are returned with every response.
+
+### 14.2 Account lockout and brute-force defenses
+
+- **Account lockout**: Repeated failed login attempts for an email account are tracked in Redis. Upon 5 consecutive failures, the account is temporarily locked for 15 minutes (`HTTP 429 Too Many Requests`).
+- **Constant-time verification**: If an unrecognized email attempts login, bcrypt verification is executed against a dummy hash to consume identical CPU cycles and defeat user-enumeration timing attacks.
+- **Password complexity**: User registration and invite acceptance enforce minimum 8 characters with alphanumeric and symbol complexity requirements.
+
+## 15. Structured JSON logging and distributed correlation IDs
+
+Pulse implements end-to-end distributed tracing and structured telemetry to simplify debugging across asynchronous boundaries:
+
+```text
+HTTP Request (Client)
+        ↓  (Optional 'X-Correlation-ID' header or auto-generated UUIDv4)
+CorrelationIdMiddleware (FastAPI)
+        ↓  (Sets ContextVar; sets 'X-Correlation-ID' response header)
+FastAPI Router / Service Layer
+        ↓  (Structured JSON log: timestamp, level, service, correlation_id, path, duration_ms)
+Celery Task Dispatch (`dispatch.py`)
+        ↓  (Injects correlation_id into Celery task headers: `execute_job.apply_async(..., headers={...})`)
+Redis Broker (Task Queue)
+        ↓
+Celery Worker (`task_prerun` signal in `celery_app.py`)
+        ↓  (Extracts correlation_id from task headers; re-binds into worker ContextVar)
+Job Execution & State Machine (`tasks.py`)
+        ↓  (Worker logs emit identical correlation_id for claiming, execution, retries, and failures)
+Worker Completion (`task_postrun` signal resets ContextVar)
+```
+
+### Key properties
+
+- **Unified Context Propagation**: Asynchronous job submission and background worker execution are correlated using the same ID, allowing operators to track a single workflow from frontend HTTP submission through queueing and worker execution to completion.
+- **Single-Line Structured JSON**: In production (`LOG_FORMAT=json`), all log messages are formatted as single-line JSON with standardized keys (`timestamp`, `level`, `service`, `logger`, `module`, `line`, `correlation_id`, `message`, `exception`, and contextual `extra` fields), ready for ingestion by ELK, Datadog, Loki, or CloudWatch.
+- **Zero-Dependency Core**: Context propagation leverages Python's built-in `contextvars`, and the JSON formatter uses the standard library `json` module, maintaining zero external runtime dependencies for logging infrastructure.
+
+## 16. Prometheus metrics and deep healthchecks
+
+Pulse exposes industry-standard observability endpoints for platform telemetry, cluster alerting, and orchestrator lifecycle management:
+
+```text
+Prometheus Scraper
+        ↓ (GET /metrics every 15s)
+FastAPI Metrics Router (`app/routers/health.py`)
+        ↓
+Metrics Collector (`app/metrics.py`)
+        ├── 1. Probes PostgreSQL (latency + 'SELECT 1')
+        ├── 2. Probes Redis (latency + 'PING')
+        ├── 3. Queries active queue depths (`ix_jobs_queue_status`)
+        ├── 4. Counts active worker heartbeats (last 60s)
+        └── 5. Renders Prometheus exposition text (0.0.4)
+        ↓
+Prometheus Engine / Grafana Dashboard / Alertmanager
+```
+
+### 16.1 Prometheus metrics exposition (`GET /metrics`)
+
+- **Standard Text Format**: Outputs text conforming strictly to Prometheus exposition format 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`).
+- **Dynamic Queue Depths**: Aggregates job counts by queue and status (`pulse_queue_depth{queue="default",status="queued"}`) on scrape, providing immediate visibility into queue backlogs and worker starvation.
+- **Worker Availability**: Measures active cluster workers (`pulse_workers_active`) based on the 60-second rolling heartbeat window.
+- **Low Cardinality HTTP Telemetry**: HTTP request counts and latency histograms normalize dynamic path parameters (replacing UUIDs and entity IDs with `/:id`) to prevent high-cardinality memory exhaustion in long-running deployments.
+- **Security & Error Counters**: Tracks brute-force lockouts (`pulse_account_lockouts_total`), failed authentications (`pulse_failed_logins_total`), rate limit rejections (`pulse_rate_limited_requests_total`), and SSE pub/sub throughput (`pulse_events_published_total`).
+- **Fail-Safe Scrapes**: If PostgreSQL or Redis is down, `/metrics` does not crash with HTTP 500; it reports `pulse_component_up{component="..."} 0` with `pulse_up 1`, allowing Prometheus to alert on dependency failure without losing scrape telemetry.
+
+### 16.2 Deep readiness probe vs. process liveness
+
+Pulse decouples readiness and liveness to satisfy cloud-native orchestration standards (Kubernetes, AWS ECS, Docker Compose):
+
+| Endpoint | Probe Type | Verification | Success | Failure |
+|---|---|---|---|---|
+| `GET /health` | Readiness | PostgreSQL ping (`SELECT 1`) + Redis ping (`PING`) with latencies | `HTTP 200 OK` | `HTTP 503 Service Unavailable` |
+| `GET /health/live` | Liveness | FastAPI ASGI process responsiveness | `HTTP 200 OK` | Process terminated / deadlocked |
+
+This separation prevents cascade restart storms: during external database maintenance or brief network partitions, orchestrators avoid killing and restarting application containers while waiting for the database to resume.
+
+## 17. Production deployment hardening and container architecture
+
+Pulse implements production-grade container security, multi-stage builds, and orchestrator lifecycle management:
+
+```text
+Backend Build Pipeline:
+[Stage 1: builder (python:3.12-slim)]
+  ├── Installs build tools: gcc, libpq-dev
+  └── Compiles dependencies into /install
+             ↓ (COPY --from=builder /install /usr/local)
+[Stage 2: runtime (python:3.12-slim)]
+  ├── Installs runtime libraries only: libpq5, curl
+  ├── Drops compiler tools and development headers
+  ├── Creates unprivileged user: pulse (UID 10001)
+  ├── Copies app code with --chown=pulse:pulse
+  └── Runs as USER pulse with HEALTHCHECK
+
+Frontend Build Pipeline:
+[Stage 1: deps] → [Stage 2: builder (Next.js standalone)]
+             ↓ (COPY standalone output)
+[Stage 3: runner (node:20-alpine)]
+  ├── Drops devDependencies (90% size reduction)
+  ├── Creates unprivileged user: nextjs (UID 1001)
+  └── Runs as USER nextjs with HEALTHCHECK
+```
+
+### 17.1 Security boundaries & non-root execution
+
+- **Unprivileged Users**: Neither the API nor Celery workers run as `root`. System user `pulse:pulse` (UID/GID 10001) runs all backend and worker workloads, while `nextjs:nodejs` (UID/GID 1001) runs the frontend.
+- **Privilege Escalation Prevention**: All containers enforce `security_opt: [ "no-new-privileges:true" ]`, preventing binaries inside containers from acquiring additional privileges via setuid or capabilities.
+- **Compiler Exclusion**: Compilers (`gcc`) and development header files (`libpq-dev`) are isolated strictly to builder stages and never exist in runtime images, mitigating remote code execution escalation vectors.
+
+### 17.2 Context optimization & standalone output
+
+- **Layer Cache Hygiene**: Scoped `.dockerignore` files prevent local `__pycache__`, `.pytest_cache`, `.git`, and `node_modules` from polluting the Docker daemon build context or invalidating build cache layers.
+- **Standalone Next.js**: The frontend uses `output: "standalone"` to bundle only the exact files and node modules required for server-side rendering, drastically shrinking production container footprint.
+
+### 17.3 Orchestrator lifecycle & healthcheck chain
+
+Containers declare explicit healthchecks and start sequences:
+1. `postgres` (`pg_isready`) and `redis` (`redis-cli ping`) reach healthy status.
+2. `api` runs `alembic upgrade head` and enters `service_healthy` after passing `/health` readiness probes.
+3. `worker-internal`, `worker-high`, `worker-normal`, `worker-low`, `beat`, and `frontend` start safely after dependencies verify readiness.
+4. `restart: unless-stopped` ensures automated container recovery across machine restarts.
+
+## 18. Automated data retention and table pruning
+
+High-throughput distributed schedulers generate millions of operational records over time. Without automated pruning, unbounded table and index growth degrades query performance, inflates PostgreSQL WAL logs, and increases storage costs:
+
+```text
+Celery Beat Scheduler (hourly) OR Admin Operator (`POST /admin/prune`)
+                       ↓
+Redis Lock (`pulse:lock:prune_stale_data`, TTL 300s)
+                       ↓
+`run_retention_prune` (`app/retention.py` on queue `pulse.internal`)
+  ├── 1. WorkerHeartbeat (< 7 days, batch=1000)
+  ├── 2. JobLog (< 30 days, batch=1000)
+  ├── 3. JobExecution (< 30 days, finished, batch=1000)
+  ├── 4. Job (< 60 days, terminal COMPLETED/DEAD_LETTER, batch=1000)
+  └── 5. AuditLog (< 365 days if enabled, batch=1000)
+                       ↓
+Metrics & Audit Trail:
+  ├── Emit Prometheus counter `pulse_pruned_rows_total{table="..."}`
+  ├── Update gauge `pulse_last_prune_timestamp_seconds`
+  └── Write immutable `AuditLog` record (`action="system.data_prune"`)
+```
+
+### 18.1 Key operational safeguards
+
+- **Batch Deletion**: Instead of executing large, monolithic `DELETE FROM table WHERE ...` statements that lock entire tables and generate gigabytes of WAL spikes, Pulse deletes in configurable chunks (`PRUNE_BATCH_SIZE=1000`) committing each batch incrementally.
+- **Queue Isolation**: The periodic pruning task runs strictly on `pulse.internal`. High volumes of user job dispatches will never starve or delay scheduled housekeeping.
+- **Concurrency Locking**: Periodic Beat dispatch is guarded by a Redis mutex lock (`pulse:lock:prune_stale_data`). If a large prune takes longer than expected, overlapping executions are safely skipped.
+- **Compliance Auditability**: System-level prune operations are permanently recorded in PostgreSQL audit logs, documenting exact deleted row counts across tables, execution duration in milliseconds, and the actor (automated Beat or system admin).
+
+
+
+

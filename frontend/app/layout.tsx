@@ -18,11 +18,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <span className="brand-name">PULSE</span>
             </div>
             <NavLinks />
-            <div style={{ marginTop: "auto", paddingTop: 20 }}>
-              <svg className="pulse-trace" viewBox="0 0 84 28" preserveAspectRatio="none">
-                <path d="M0 14 H24 L30 4 L36 24 L42 14 H84" />
-              </svg>
-            </div>
+            <svg className="pulse-trace" viewBox="0 0 84 28" preserveAspectRatio="none" style={{ marginTop: 20 }}>
+              <path d="M0 14 H24 L30 4 L36 24 L42 14 H84" />
+            </svg>
           </aside>
           <main className="main">{children}</main>
         </div>

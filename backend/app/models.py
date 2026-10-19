@@ -26,6 +26,17 @@ def gen_uuid():
 
 # ---------- Enums ----------
 
+class UserRole(str, enum.Enum):
+    SYSTEM_ADMIN = "system_admin"  # Platform operator: sees all orgs/users
+    ORG_ADMIN = "org_admin"        # Org owner: can invite members, manage org
+    MEMBER = "member"              # Invited user: can use org resources
+
+
+class OrgMemberRole(str, enum.Enum):
+    ADMIN = "admin"    # Can manage org (invite, edit queues)
+    MEMBER = "member"  # Read/use access within the org
+
+
 class JobStatus(str, enum.Enum):
     BLOCKED = "blocked"
     QUEUED = "queued"
@@ -63,10 +74,15 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=True)
+    # Platform-level role. Most users are ORG_ADMIN (first user in their org)
+    # or MEMBER (invited). SYSTEM_ADMIN is reserved for the platform operator
+    # and is granted only to the first-ever user on a fresh install.
+    role = Column(Enum(UserRole), nullable=False, default=UserRole.ORG_ADMIN)
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organizations = relationship("Organization", back_populates="owner")
     refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
+    org_memberships = relationship("OrganizationMember", back_populates="user", cascade="all, delete-orphan")
 
 
 class RefreshToken(Base):
@@ -95,6 +111,48 @@ class Organization(Base):
 
     owner = relationship("User", back_populates="organizations")
     projects = relationship("Project", back_populates="organization", cascade="all, delete-orphan")
+    members = relationship("OrganizationMember", back_populates="organization", cascade="all, delete-orphan")
+    invite_tokens = relationship("InviteToken", back_populates="organization", cascade="all, delete-orphan")
+
+
+class OrganizationMember(Base):
+    """Maps users to organizations with a per-org role (admin or member).
+    Every user who has access to an org has a row here, including the owner.
+    This is the authority table for all org-level access checks."""
+
+    __tablename__ = "organization_members"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    org_id = Column(UUID(as_uuid=False), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(Enum(OrgMemberRole), nullable=False, default=OrgMemberRole.MEMBER)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    organization = relationship("Organization", back_populates="members")
+    user = relationship("User", back_populates="org_memberships")
+
+    __table_args__ = (UniqueConstraint("org_id", "user_id", name="uq_org_member"),)
+
+
+class InviteToken(Base):
+    """Short-lived invite token issued by an org admin.
+    The raw token is returned once to the inviter and never stored — only its
+    SHA-256 hash is persisted so a DB leak cannot be replayed as an invite."""
+
+    __tablename__ = "invite_tokens"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    org_id = Column(UUID(as_uuid=False), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    invited_by_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # Intended recipient — enforced at accept time so the link can't be
+    # reused by a different email address.
+    email = Column(String(255), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    organization = relationship("Organization", back_populates="invite_tokens")
 
 
 class Project(Base):
@@ -265,3 +323,23 @@ class DeadLetterJob(Base):
     failed_at = Column(DateTime, default=utcnow, nullable=False)
 
     job = relationship("Job", back_populates="dead_letter_entry")
+
+
+class AuditLog(Base):
+    """Immutable audit trail for sensitive operator and administrative actions.
+    Persists actor, organization, action type, affected resource, and metadata."""
+
+    __tablename__ = "audit_logs"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    org_id = Column(UUID(as_uuid=False), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action = Column(String(100), nullable=False, index=True)
+    resource_type = Column(String(50), nullable=False, index=True)
+    resource_id = Column(String(255), nullable=True)
+    details = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+    user = relationship("User")
+    organization = relationship("Organization")
+

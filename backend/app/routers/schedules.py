@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.deps import get_current_user
+from app.deps import get_current_user, user_can_access_org
 from app.models import JobSchedule, Organization, Project, Queue, User
 from app.routers.jobs import _get_owned_queue
 from app.schemas import JobScheduleCreate, JobScheduleOut
@@ -15,13 +15,13 @@ def _get_owned_schedule(db: Session, schedule_id: str, user: User) -> JobSchedul
         db.query(JobSchedule)
         .join(Queue, JobSchedule.queue_id == Queue.id)
         .join(Project, Queue.project_id == Project.id)
-        .join(Organization, Project.org_id == Organization.id)
-        .filter(JobSchedule.id == schedule_id, Organization.owner_id == user.id)
+        .filter(JobSchedule.id == schedule_id)
         .first()
     )
-    if not schedule:
+    if not schedule or not user_can_access_org(db, user, schedule.queue.project.org_id):
         raise HTTPException(status_code=404, detail="Schedule not found")
     return schedule
+
 
 
 @router.post("/projects/{project_id}/queues/{queue_id}/schedules", response_model=JobScheduleOut, status_code=201)
@@ -50,6 +50,22 @@ def list_schedules(project_id: str, queue_id: str, db: Session = Depends(get_db)
 def toggle_schedule(schedule_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     schedule = _get_owned_schedule(db, schedule_id, user)
     schedule.is_active = not schedule.is_active
+    from app.audit import log_audit_event
+    log_audit_event(
+        db=db,
+        action="schedule.toggle",
+        resource_type="schedule",
+        resource_id=schedule.id,
+        user=user,
+        org_id=schedule.queue.project.org_id,
+        details={"schedule_name": schedule.name, "is_active": schedule.is_active},
+    )
+    from app.events import publish_event
+    publish_event(schedule.queue.project.org_id, "schedule.toggled", {
+        "schedule_id": schedule.id,
+        "is_active": schedule.is_active,
+    })
     db.commit()
     db.refresh(schedule)
     return schedule
+

@@ -1,37 +1,41 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import { api, DeadLetterJob, hasSession, Project, Queue, Worker } from "../lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { api, DeadLetterJob, Project, Queue, Worker } from "../lib/api";
+import { useEvents } from "../lib/useEvents";
 
 export default function DashboardPage() {
-  const router = useRouter();
   const [projects, setProjects] = useState<Project[]>([]);
   const [queues, setQueues] = useState<Queue[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [dlq, setDlq] = useState<DeadLetterJob[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const loadDashboardData = useCallback(async () => {
+    try {
+      const projs = await api<Project[]>("/projects");
+      setProjects(projs);
+      const queueLists = await Promise.all(
+        projs.map((p) => api<Queue[]>(`/projects/${p.id}/queues`))
+      );
+      setQueues(queueLists.flat());
+      setWorkers(await api<Worker[]>("/workers"));
+      setDlq(await api<DeadLetterJob[]>("/dead-letter-jobs"));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    (async () => {
-      if (!(await hasSession())) {
-        router.push("/login");
-        return;
-      }
-      try {
-        const projs = await api<Project[]>("/projects");
-        setProjects(projs);
-        const queueLists = await Promise.all(
-          projs.map((p) => api<Queue[]>(`/projects/${p.id}/queues`))
-        );
-        setQueues(queueLists.flat());
-        setWorkers(await api<Worker[]>("/workers"));
-        setDlq(await api<DeadLetterJob[]>("/dead-letter-jobs"));
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [router]);
+    loadDashboardData();
+  }, [loadDashboardData]);
+
+  // Instantly refresh dashboard on real-time SSE events
+  useEvents(useCallback((event) => {
+    if (event.event.startsWith("job.") || event.event.startsWith("queue.")) {
+      loadDashboardData();
+    }
+  }, [loadDashboardData]));
 
   if (loading) return <p className="page-subtitle">Loading…</p>;
 

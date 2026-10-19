@@ -1,9 +1,15 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import JobStatus, RetryStrategy, WorkerStatus, LogLevel
+try:
+    import email_validator  # noqa: F401
+    from pydantic import EmailStr
+except ImportError:
+    EmailStr = str  # Fallback for environments without email-validator installed
+
+from app.models import JobStatus, OrgMemberRole, RetryStrategy, UserRole, WorkerStatus, LogLevel
 
 
 # ---------- Auth ----------
@@ -14,13 +20,108 @@ class UserCreate(BaseModel):
     full_name: Optional[str] = None
     organization_name: str
 
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not (any(c.isalpha() for c in v) and any(not c.isalpha() for c in v)):
+            raise ValueError("Password must contain both letters and numbers/symbols")
+        return v
+
 
 class UserOut(BaseModel):
     id: str
     email: EmailStr
     full_name: Optional[str] = None
+    role: UserRole
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Invite / Members ----------
+
+class InviteCreate(BaseModel):
+    """Body for POST /orgs/me/invite — sent by an org admin."""
+    email: EmailStr
+
+
+class InviteOut(BaseModel):
+    """Returned to the inviting admin. The raw token is shown once."""
+    invite_token: str
+    email: str
+    expires_at: datetime
+
+
+class AcceptInviteRequest(BaseModel):
+    """Body for POST /auth/accept-invite — submitted by the invitee."""
+    token: str
+    email: EmailStr
+    password: str = Field(min_length=8)
+    full_name: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not (any(c.isalpha() for c in v) and any(not c.isalpha() for c in v)):
+            raise ValueError("Password must contain both letters and numbers/symbols")
+        return v
+
+
+class OrgMemberOut(BaseModel):
+    id: str
+    user_id: str
+    email: str
+    full_name: Optional[str]
+    role: OrgMemberRole
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrgOut(BaseModel):
+    id: str
+    name: str
+    owner_id: str
+    member_count: int
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Admin (system-level) ----------
+
+class AdminOrgOut(BaseModel):
+    id: str
+    name: str
+    owner_id: str
+    member_count: int
+    created_at: datetime
+
+
+class AdminUserOut(BaseModel):
+    id: str
+    email: str
+    full_name: Optional[str]
+    role: UserRole
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UpdateUserRole(BaseModel):
+    role: UserRole
+
+
+class AdminStatsOut(BaseModel):
+    total_organizations: int
+    total_users: int
+    total_projects: int
+    total_queues: int
+    total_jobs: int
+
 
 
 # ---------- Projects ----------
@@ -198,3 +299,21 @@ class DeadLetterJobOut(BaseModel):
     failed_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Audit Logs ----------
+
+class AuditLogOut(BaseModel):
+    id: str
+    org_id: Optional[str]
+    user_id: Optional[str]
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    action: str
+    resource_type: str
+    resource_id: Optional[str]
+    details: dict[str, Any]
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+

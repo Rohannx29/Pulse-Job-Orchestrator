@@ -5,8 +5,16 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import redis
-from celery.utils.log import get_task_logger
-from croniter import croniter
+try:
+    from celery.utils.log import get_task_logger
+    logger = get_task_logger(__name__)
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
+try:
+    from croniter import croniter
+except ImportError:
+    croniter = None
 
 from app.celery_app import celery_app
 from app.concurrency import acquire_queue_slot, release_queue_slot
@@ -14,6 +22,7 @@ from app.timeutils import utcnow
 from app.config import settings
 from app.database import SessionLocal
 from app.dispatch import dispatch_job
+from app.events import get_job_org_id, publish_event
 from app.models import (
     DeadLetterJob,
     Job,
@@ -30,7 +39,6 @@ from app.models import (
     WorkerStatus,
 )
 from app.worker_registry import get_or_create_worker
-logger = get_task_logger(__name__)
 _redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 
@@ -156,6 +164,14 @@ def _release_dependents(db, completed_job: Job):
     )
     for dependent in blocked:
         dispatch_job(dependent)
+        dep_org_id = get_job_org_id(db, dependent)
+        if dep_org_id:
+            publish_event(dep_org_id, "job.queued", {
+                "job_id": dependent.id,
+                "queue_id": dependent.queue_id,
+                "status": dependent.status.value,
+                "unblocked_by": completed_job.id,
+            })
         logger.info("Dependency %s completed, releasing dependent job %s", completed_job.id, dependent.id)
     if blocked:
         db.commit()
@@ -180,6 +196,14 @@ def _cascade_fail_dependents(db, dead_job: Job, reason: str):
                 retry_count_at_failure=0,
             )
         )
+        dep_org_id = get_job_org_id(db, dependent)
+        if dep_org_id:
+            publish_event(dep_org_id, "job.dead_letter", {
+                "job_id": dependent.id,
+                "queue_id": dependent.queue_id,
+                "reason": f"Upstream dependency {dead_job.id} failed: {reason}",
+                "status": JobStatus.DEAD_LETTER.value,
+            })
         logger.warning("Cascading DLQ from %s to blocked dependent %s", dead_job.id, dependent.id)
         db.commit()
         _cascade_fail_dependents(db, dependent, f"upstream dependency {dead_job.id} failed")
@@ -222,16 +246,29 @@ def execute_job(self, job_id: str):
         job.claimed_by_worker_id = worker.id
         db.commit()
 
+        org_id = get_job_org_id(db, job)
+        if org_id:
+            publish_event(org_id, "job.claimed", {
+                "job_id": job.id,
+                "queue_id": queue.id,
+                "worker_id": worker.id,
+                "worker_hostname": self.request.hostname,
+                "status": JobStatus.CLAIMED.value,
+            })
+
         try:
-            _execute_job_inner(self, db, job, worker)
+            _execute_job_inner(self, db, job, worker, org_id)
         finally:
             release_queue_slot(queue.id, lease_token)
     finally:
         db.close()
 
 
-def _execute_job_inner(self, db, job: Job, worker: Worker):
+def _execute_job_inner(self, db, job: Job, worker: Worker, org_id: str | None = None):
     try:
+        if org_id is None:
+            org_id = get_job_org_id(db, job)
+
         attempt_number = job.current_retry_count + 1
         job.status = JobStatus.RUNNING
         job.celery_task_id = self.request.id
@@ -249,6 +286,15 @@ def _execute_job_inner(self, db, job: Job, worker: Worker):
         _log(db, execution, LogLevel.INFO, f"Attempt {attempt_number} started on worker {self.request.hostname}")
         db.commit()
 
+        if org_id:
+            publish_event(org_id, "job.running", {
+                "job_id": job.id,
+                "queue_id": job.queue_id,
+                "worker_id": worker.id,
+                "attempt_number": attempt_number,
+                "status": JobStatus.RUNNING.value,
+            })
+
         result = _run_handler(job.payload)
 
         execution.status = JobStatus.COMPLETED
@@ -258,6 +304,14 @@ def _execute_job_inner(self, db, job: Job, worker: Worker):
 
         job.status = JobStatus.COMPLETED
         db.commit()
+
+        if org_id:
+            publish_event(org_id, "job.completed", {
+                "job_id": job.id,
+                "queue_id": job.queue_id,
+                "status": JobStatus.COMPLETED.value,
+                "result": result,
+            })
 
         _release_dependents(db, job)
 
@@ -284,6 +338,16 @@ def _execute_job_inner(self, db, job: Job, worker: Worker):
             db.commit()
             delay = _compute_backoff_seconds(policy, job.current_retry_count)
             logger.info("Retrying job %s in %ss (attempt %s/%s)", job.id, delay, job.current_retry_count, job.max_retries)
+            if org_id:
+                publish_event(org_id, "job.failed", {
+                    "job_id": job.id,
+                    "queue_id": job.queue_id,
+                    "attempt_number": job.current_retry_count,
+                    "max_retries": job.max_retries,
+                    "retry_delay_seconds": delay,
+                    "error_message": str(exc),
+                    "status": JobStatus.QUEUED.value,
+                })
             raise self.retry(exc=exc, countdown=delay, max_retries=job.max_retries)
 
         # Retries exhausted -> Dead Letter Queue
@@ -298,6 +362,14 @@ def _execute_job_inner(self, db, job: Job, worker: Worker):
         )
         db.commit()
         logger.warning("Job %s exhausted retries, moved to DLQ", job.id)
+
+        if org_id:
+            publish_event(org_id, "job.dead_letter", {
+                "job_id": job.id,
+                "queue_id": job.queue_id,
+                "reason": str(exc),
+                "status": JobStatus.DEAD_LETTER.value,
+            })
 
         _cascade_fail_dependents(db, job, str(exc))
 
@@ -385,3 +457,23 @@ def dispatch_due_schedules():
     finally:
         db.close()
         _redis.delete("pulse:lock:dispatch_due_schedules")
+
+
+@celery_app.task(name="app.tasks.prune_stale_data")
+def prune_stale_data():
+    """Runs on a Beat interval. Deletes stale execution logs, worker heartbeats,
+    and ancient terminal jobs in accordance with retention policy.
+    Guarded by Redis lock to ensure single-worker execution."""
+    have_lock = _redis.set("pulse:lock:prune_stale_data", "1", nx=True, ex=300)
+    if not have_lock:
+        logger.info("prune_stale_data already in progress, skipping this tick")
+        return {"status": "skipped", "reason": "lock_acquired"}
+
+    from app.retention import run_retention_prune
+    db = SessionLocal()
+    try:
+        return run_retention_prune(db=db)
+    finally:
+        db.close()
+        _redis.delete("pulse:lock:prune_stale_data")
+

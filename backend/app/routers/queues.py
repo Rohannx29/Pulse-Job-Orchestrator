@@ -6,21 +6,20 @@ from sqlalchemy.orm import Session
 
 from app.concurrency import current_usage
 from app.database import get_db
-from app.deps import get_current_user
+from app.deps import get_current_user, user_can_access_org
 from app.models import Job, JobExecution, JobStatus, Project, Queue, RetryPolicy, User
 from app.schemas import QueueCreate, QueueOut, QueueStatsOut, QueueUpdate, RetryPolicyCreate, RetryPolicyOut
-from app.routers.projects import _get_user_org
 from app.timeutils import utcnow
 
 router = APIRouter(prefix="/projects/{project_id}/queues", tags=["queues"])
 
 
 def _get_project(db: Session, project_id: str, user: User) -> Project:
-    org = _get_user_org(db, user)
-    project = db.query(Project).filter(Project.id == project_id, Project.org_id == org.id).first()
-    if not project:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project or not user_can_access_org(db, user, project.org_id):
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
 
 
 def _get_queue(db: Session, project_id: str, queue_id: str, user: User) -> Queue:
@@ -47,11 +46,30 @@ def list_queues(project_id: str, db: Session = Depends(get_db), user: User = Dep
     return db.query(Queue).filter(Queue.project_id == project_id).all()
 
 
+from app.audit import log_audit_event
+
+
 @router.patch("/{queue_id}", response_model=QueueOut)
 def update_queue(project_id: str, queue_id: str, payload: QueueUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     queue = _get_queue(db, project_id, queue_id, user)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(queue, field, value)
+    log_audit_event(
+        db=db,
+        action="queue.update",
+        resource_type="queue",
+        resource_id=queue.id,
+        user=user,
+        org_id=queue.project.org_id,
+        details={"queue_name": queue.name, "changes": changes},
+    )
+    from app.events import publish_event
+    publish_event(queue.project.org_id, "queue.updated", {
+        "queue_id": queue.id,
+        "concurrency_limit": queue.concurrency_limit,
+        "priority": queue.priority,
+    })
     db.commit()
     db.refresh(queue)
     return queue
@@ -61,6 +79,20 @@ def update_queue(project_id: str, queue_id: str, payload: QueueUpdate, db: Sessi
 def pause_queue(project_id: str, queue_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     queue = _get_queue(db, project_id, queue_id, user)
     queue.is_paused = True
+    log_audit_event(
+        db=db,
+        action="queue.pause",
+        resource_type="queue",
+        resource_id=queue.id,
+        user=user,
+        org_id=queue.project.org_id,
+        details={"queue_name": queue.name},
+    )
+    from app.events import publish_event
+    publish_event(queue.project.org_id, "queue.paused", {
+        "queue_id": queue.id,
+        "is_paused": True,
+    })
     db.commit()
     db.refresh(queue)
     return queue
@@ -70,9 +102,24 @@ def pause_queue(project_id: str, queue_id: str, db: Session = Depends(get_db), u
 def resume_queue(project_id: str, queue_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     queue = _get_queue(db, project_id, queue_id, user)
     queue.is_paused = False
+    log_audit_event(
+        db=db,
+        action="queue.resume",
+        resource_type="queue",
+        resource_id=queue.id,
+        user=user,
+        org_id=queue.project.org_id,
+        details={"queue_name": queue.name},
+    )
+    from app.events import publish_event
+    publish_event(queue.project.org_id, "queue.resumed", {
+        "queue_id": queue.id,
+        "is_paused": False,
+    })
     db.commit()
     db.refresh(queue)
     return queue
+
 
 
 @router.post("/{queue_id}/retry-policies", response_model=RetryPolicyOut, status_code=201)

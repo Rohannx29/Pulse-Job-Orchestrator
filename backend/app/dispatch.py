@@ -12,12 +12,30 @@ from app.timeutils import utcnow
 def dispatch_job(job: Job) -> None:
     # Imported lazily to avoid a circular import (tasks.py imports this
     # module too, and celery_app/tasks are what actually run the job).
+    from app.events import publish_event
+    from app.logging_config import get_correlation_id
     from app.tasks import execute_job
+
+    corr_id = get_correlation_id() or str(job.id)
+    task_headers = {"correlation_id": corr_id}
 
     celery_queue = priority_to_celery_queue(job.priority)
     if job.run_at and job.run_at > utcnow():
         job.status = JobStatus.SCHEDULED
-        execute_job.apply_async(args=[job.id], eta=job.run_at, queue=celery_queue)
+        execute_job.apply_async(args=[job.id], eta=job.run_at, queue=celery_queue, headers=task_headers)
     else:
         job.status = JobStatus.QUEUED
-        execute_job.apply_async(args=[job.id], queue=celery_queue)
+        execute_job.apply_async(args=[job.id], queue=celery_queue, headers=task_headers)
+
+    try:
+        if job.queue and job.queue.project:
+            publish_event(job.queue.project.org_id, "job.queued" if job.status == JobStatus.QUEUED else "job.scheduled", {
+                "job_id": job.id,
+                "queue_id": job.queue_id,
+                "name": job.name,
+                "status": job.status.value,
+                "priority": job.priority,
+            })
+    except Exception:
+        pass
+

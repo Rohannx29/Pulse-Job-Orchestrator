@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.deps import get_current_user
-from app.models import Job, JobStatus, Organization, Project, Queue, User, Worker
+from app.deps import get_current_user, get_user_org
+from app.models import Job, JobStatus, Project, Queue, User, UserRole, Worker
 from app.schemas import JobOut, WorkerOut
 
 router = APIRouter(tags=["workers"])
@@ -21,15 +21,16 @@ def worker_assigned_jobs(worker_id: str, db: Session = Depends(get_db), user: Us
     (see docs/design-decisions.md) — any worker may pick up any org's
     job — but the job details returned here stay tenant-scoped like every
     other job-data endpoint."""
-    return (
+    q = (
         db.query(Job)
         .join(Queue, Job.queue_id == Queue.id)
         .join(Project, Queue.project_id == Project.id)
-        .join(Organization, Project.org_id == Organization.id)
         .filter(
             Job.claimed_by_worker_id == worker_id,
             Job.status.in_([JobStatus.CLAIMED, JobStatus.RUNNING]),
-            Organization.owner_id == user.id,
         )
-        .all()
     )
+    if user.role != UserRole.SYSTEM_ADMIN:
+        org = get_user_org(db, user)
+        q = q.filter(Project.org_id == org.id)
+    return q.all()

@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
@@ -10,8 +10,15 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     },
   });
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`${res.status}: ${body}`);
+    let message = `${res.status}`;
+    try {
+      const data = await res.json();
+      if (data && data.detail) message = data.detail;
+    } catch {
+      const text = await res.text().catch(() => "");
+      if (text) message = text;
+    }
+    throw new Error(message);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -24,7 +31,33 @@ export async function login(email: string, password: string): Promise<void> {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ username: email, password }),
   });
-  if (!res.ok) throw new Error("Invalid credentials");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: "Invalid credentials" }));
+    throw new Error(body.detail || "Invalid credentials");
+  }
+}
+
+export async function register(
+  email: string,
+  password: string,
+  fullName: string,
+  organizationName: string
+): Promise<void> {
+  const res = await fetch(`${API_URL}/auth/register`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      email,
+      password,
+      full_name: fullName,
+      organization_name: organizationName,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: "Registration failed" }));
+    throw new Error(body.detail || "Registration failed");
+  }
 }
 
 export async function logout(): Promise<void> {
@@ -36,7 +69,112 @@ export async function hasSession(): Promise<boolean> {
   return res.ok;
 }
 
+export async function getMe(): Promise<User> {
+  return api<User>("/auth/me");
+}
+
+export async function acceptInvite(
+  token: string,
+  email: string,
+  password: string,
+  fullName?: string
+): Promise<void> {
+  const res = await fetch(`${API_URL}/auth/accept-invite`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      token,
+      email,
+      password,
+      full_name: fullName,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: "Accepting invite failed" }));
+    throw new Error(body.detail || "Accepting invite failed");
+  }
+}
+
+export interface User {
+  id: string;
+  email: string;
+  full_name?: string | null;
+  role: "system_admin" | "org_admin" | "member";
+}
+
+export interface Org {
+  id: string;
+  name: string;
+  owner_id: string;
+  member_count: number;
+  created_at: string;
+}
+
+export interface OrgMember {
+  id: string;
+  user_id: string;
+  email: string;
+  full_name?: string | null;
+  role: "admin" | "member";
+  created_at: string;
+}
+
+export interface AdminOrg {
+  id: string;
+  name: string;
+  owner_id: string;
+  member_count: number;
+  created_at: string;
+}
+
+export interface AdminUser {
+  id: string;
+  email: string;
+  full_name?: string | null;
+  role: "system_admin" | "org_admin" | "member";
+  created_at: string;
+}
+
+export interface AdminStats {
+  total_organizations: number;
+  total_users: number;
+  total_projects: number;
+  total_queues: number;
+  total_jobs: number;
+}
+
+export interface AuditLog {
+  id: string;
+  org_id?: string | null;
+  user_id?: string | null;
+  user_email?: string | null;
+  user_name?: string | null;
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+  details: Record<string, unknown>;
+  created_at: string;
+}
+
+export async function getAuditLogs(params?: {
+  action?: string;
+  resource_type?: string;
+  skip?: number;
+  limit?: number;
+}): Promise<AuditLog[]> {
+  const query = new URLSearchParams();
+  if (params?.action) query.set("action", params.action);
+  if (params?.resource_type) query.set("resource_type", params.resource_type);
+  if (params?.skip) query.set("skip", params.skip.toString());
+  if (params?.limit) query.set("limit", params.limit.toString());
+  const qs = query.toString();
+  return api<AuditLog[]>(`/audit-logs${qs ? `?${qs}` : ""}`);
+}
+
+
 export interface Project {
+
   id: string;
   name: string;
   description?: string;
@@ -119,3 +257,25 @@ export interface JobDetail extends Job {
   depends_on_job_id: string | null;
   executions: JobExecution[];
 }
+
+export interface ComponentHealth {
+  status: "healthy" | "unhealthy";
+  latency_ms: number;
+  error?: string;
+}
+
+export interface SystemHealth {
+  status: "healthy" | "unhealthy";
+  timestamp: string;
+  version: string;
+  components: {
+    database?: ComponentHealth;
+    redis?: ComponentHealth;
+  };
+}
+
+export async function getSystemHealth(): Promise<SystemHealth> {
+  const res = await fetch(`${API_URL}/health`);
+  return res.json();
+}
+

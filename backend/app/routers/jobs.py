@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.deps import get_current_user
+from app.deps import get_current_user, user_can_access_org
 from app.dispatch import dispatch_job
 from app.models import Job, JobStatus, Organization, Project, Queue, User
 from app.schemas import JobBatchCreate, JobCreate, JobDetailOut, JobOut
@@ -17,11 +17,10 @@ def _get_owned_queue(db: Session, project_id: str, queue_id: str, user: User) ->
     queue = (
         db.query(Queue)
         .join(Project, Queue.project_id == Project.id)
-        .join(Organization, Project.org_id == Organization.id)
-        .filter(Queue.id == queue_id, Project.id == project_id, Organization.owner_id == user.id)
+        .filter(Queue.id == queue_id, Project.id == project_id)
         .first()
     )
-    if not queue:
+    if not queue or not user_can_access_org(db, user, queue.project.org_id):
         raise HTTPException(status_code=404, detail="Queue not found")
     return queue
 
@@ -31,13 +30,13 @@ def _get_owned_job(db: Session, job_id: str, user: User) -> Job:
         db.query(Job)
         .join(Queue, Job.queue_id == Queue.id)
         .join(Project, Queue.project_id == Project.id)
-        .join(Organization, Project.org_id == Organization.id)
-        .filter(Job.id == job_id, Organization.owner_id == user.id)
+        .filter(Job.id == job_id)
         .first()
     )
-    if not job:
+    if not job or not user_can_access_org(db, user, job.queue.project.org_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
 
 
 def _dispatch(job: Job):
@@ -56,6 +55,24 @@ def create_job(
     queue = _get_owned_queue(db, project_id, queue_id, user)
     if queue.is_paused:
         raise HTTPException(status_code=409, detail="Queue is paused")
+
+    # Tenant-scoped job creation rate limiting (120 submissions/min per organization)
+    from app.rate_limiter import check_rate_limit
+    org_id = queue.project.org_id
+    allowed, remaining, retry_after = check_rate_limit(
+        f"pulse:ratelimit:org:{org_id}:job_create",
+        limit=120,
+        window_seconds=60,
+    )
+    response.headers["X-RateLimit-Limit"] = "120"
+    response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
+    response.headers["X-RateLimit-Reset"] = str(retry_after)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Job submission rate limit exceeded for this organization. Maximum 120 jobs per minute. Retry in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     if payload.idempotency_key:
         existing = (
@@ -199,6 +216,20 @@ def retry_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(g
     if job.status not in (JobStatus.FAILED, JobStatus.DEAD_LETTER):
         raise HTTPException(status_code=409, detail="Only failed or dead-lettered jobs can be manually retried")
 
+    # Tenant-scoped retry rate limiting (30 retries/min per organization)
+    from app.rate_limiter import check_rate_limit
+    allowed, remaining, retry_after = check_rate_limit(
+        f"pulse:ratelimit:org:{job.queue.project.org_id}:job_retry",
+        limit=30,
+        window_seconds=60,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Job retry rate limit exceeded for this organization. Maximum 30 retries per minute. Retry in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     # DeadLetterJob represents CURRENT dead-letter state, not a historical
     # log (JobExecution is already the audit trail for that). Without this,
     # a job retried from the DLQ that fails again a second time would hit
@@ -209,8 +240,19 @@ def retry_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(g
 
     job.current_retry_count = 0
     job.run_at = None
+    from app.audit import log_audit_event
+    log_audit_event(
+        db=db,
+        action="job.retry",
+        resource_type="job",
+        resource_id=job.id,
+        user=user,
+        org_id=job.queue.project.org_id,
+        details={"job_name": job.name, "queue_id": job.queue_id},
+    )
     db.commit()
     _dispatch(job)
     db.commit()
     db.refresh(job)
     return job
+

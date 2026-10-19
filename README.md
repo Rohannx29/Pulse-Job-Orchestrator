@@ -52,11 +52,15 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Queue statistics | ✅ | Counts, success rate, latency, throughput, concurrency |
 | HTTP job handler | ✅ | SSRF-aware URL validation, timeout and response cap |
 | Dashboard | ✅ | Next.js App Router |
-| RBAC | Planned | Current model is owner-based |
-| Audit log | Planned | Sensitive operator actions are not persisted separately |
-| Rate limiting | Planned | API/auth hardening |
-| Metrics / tracing | Planned | Prometheus/OpenTelemetry |
-| Production deployment hardening | Planned | Current Compose is development-oriented |
+| RBAC | ✅ | Multi-tenant RBAC: System Admin, Org Admin, Member roles with secure invite tokens |
+| Audit log | ✅ | Immutable audit log table with user/actor tracking and filterable dashboard explorer |
+| Real-time live updates | ✅ | Server-Sent Events (SSE) with Redis Pub/Sub scoped by tenant |
+| Rate limiting & auth hardening | ✅ | Redis sliding-window rate limiter, account lockout, constant-time verification, and tenant quotas |
+| Structured JSON logs & Correlation IDs | ✅ | Single-line JSON formatter with distributed X-Correlation-ID propagation across API and Celery |
+| Prometheus metrics & deep healthchecks | ✅ | Prometheus format (0.0.4) exposition (`/metrics`), deep readiness probe (`/health`), and liveness probe (`/health/live`) |
+| Production deployment hardening | ✅ | Multi-stage Docker builds, non-root users (`pulse:pulse`, `nextjs:nodejs`), `no-new-privileges`, healthchecks, restart policies |
+| Data retention & table pruning | ✅ | Automated Celery Beat batch pruning (`pulse.internal`) & admin trigger (`POST /admin/prune`) for heartbeats, logs, executions, and terminal jobs |
+
 
 ## Repository structure
 
@@ -85,12 +89,21 @@ pulse/
 │   │   ├── concurrency.py          # Redis queue semaphore
 │   │   ├── worker_registry.py      # worker identity/lifecycle
 │   │   ├── url_safety.py           # SSRF protections
-│   │   └── routers/                # API route modules
+│   │   ├── audit.py                # immutable audit logging helper
+│   │   ├── events.py               # Redis Pub/Sub real-time event publisher
+│   │   ├── rate_limiter.py         # Redis sliding-window rate limiter
+│   │   ├── auth_hardening.py       # account lockout and brute-force defenses
+│   │   ├── logging_config.py       # structured JSON logging & correlation IDs
+│   │   ├── metrics.py              # Prometheus metrics registry, gauges & collectors
+│   │   ├── retention.py            # automated batch data retention & table pruning
+│   │   └── routers/                # API route modules (jobs, queues, dlq, schedules, workers, projects, orgs, admin, audit, events, health, auth)
 │   └── tests/                      # unit + integration tests
 │
 ├── frontend/
-│   ├── app/                        # Next.js routes/pages
-│   └── lib/api.ts                  # API client
+│   ├── app/                        # Next.js routes/pages (dashboard, jobs, queues, schedules, workers, dlq, projects, team, admin, audit-logs, auth)
+│   ├── middleware.ts               # session verification route guard
+│   ├── lib/api.ts                  # API client
+│   └── lib/useEvents.ts            # Server-Sent Events React hook
 │
 └── docs/
     ├── architecture.md
@@ -142,10 +155,12 @@ docker compose ps
 | Dashboard | `http://localhost:3000` | Operator UI |
 | API docs | `http://localhost:8000/docs` | Swagger UI |
 | OpenAPI | `http://localhost:8000/openapi.json` | API schema |
-| Health | `http://localhost:8000/health` | API process health |
+| Health | `http://localhost:8000/health` | Deep component readiness probe (PostgreSQL + Redis) |
+| Liveness | `http://localhost:8000/health/live` | API process liveness probe |
+| Prometheus | `http://localhost:8000/metrics` | Prometheus metrics exposition (format 0.0.4) |
 | Flower | `http://localhost:5555` | Celery monitoring |
 
-> The current `/health` endpoint is a process-level health check; it does not perform a full PostgreSQL/Redis readiness check.
+> The `/health` endpoint performs deep readiness checks against PostgreSQL and Redis, returning HTTP 503 if any required component is unreachable. Container orchestrators may use `/health/live` for process liveness.
 
 ### 4. Register a user
 
@@ -348,6 +363,8 @@ Pulse currently provides:
 - httpOnly cookie-based access/refresh authentication
 - refresh-token hashing at rest
 - refresh-token rotation and family-based reuse detection
+- role-based access control (System Admin, Org Admin, Member)
+- single-use, hashed invite tokens for team onboarding
 - explicit CORS origin configuration
 - organization-scoped resource authorization
 - 404 responses for cross-organization resource access
@@ -370,17 +387,13 @@ Therefore:
 
 The following are intentionally outside the current implementation scope:
 
-- role-based access control within an organization
-- persistent audit log for sensitive operator actions
-- API rate limiting
 - Prometheus/OpenTelemetry metrics
-- correlation IDs and structured JSON logs
 - production-grade secrets management
 - production Docker hardening and a dedicated production Compose/deployment configuration
-- SSE/WebSocket dashboard updates
 - multi-parent/fan-in job dependencies
 - long-running handler lease renewal
 - full dependency-aware readiness checks
+
 
 These are documented as future hardening rather than implied as complete features.
 

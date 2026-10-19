@@ -1,6 +1,9 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_USER: pulse
       POSTGRES_PASSWORD: pulse
@@ -17,6 +20,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "6379:6379"
     healthcheck:
@@ -26,8 +32,13 @@ services:
       retries: 10
 
   api:
-    build: ./backend
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     volumes:
       - ./backend:/app
     ports:
@@ -38,17 +49,29 @@ services:
       SECRET_KEY: dev-secret-change-me
       CORS_ORIGINS: http://localhost:3000
       COOKIE_SECURE: "false"
+      IS_DEV: "true"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # Internal housekeeping only (worker heartbeat sync, cron dispatch).
   # Kept off the job-execution queues so a burst of user jobs can never
   # delay heartbeat sync or schedule dispatch.
   worker-internal:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: celery -A app.celery_app worker -Q pulse.internal --loglevel=info --concurrency=2 --hostname=worker-internal@%h
     volumes:
       - ./backend:/app
@@ -56,6 +79,7 @@ services:
       DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: dev-secret-change-me
+      IS_DEV: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,7 +91,12 @@ services:
   # not just a routing hint, since Redis-backed Celery has no native
   # per-task priority ordering.
   worker-high:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: celery -A app.celery_app worker -Q pulse.high --loglevel=info --concurrency=4 --hostname=worker-high@%h
     volumes:
       - ./backend:/app
@@ -75,11 +104,17 @@ services:
       DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: dev-secret-change-me
+      IS_DEV: "true"
     depends_on:
       - worker-internal
 
   worker-normal:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: celery -A app.celery_app worker -Q pulse.normal --loglevel=info --concurrency=4 --hostname=worker-normal@%h
     volumes:
       - ./backend:/app
@@ -87,11 +122,17 @@ services:
       DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: dev-secret-change-me
+      IS_DEV: "true"
     depends_on:
       - worker-internal
 
   worker-low:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: celery -A app.celery_app worker -Q pulse.low --loglevel=info --concurrency=2 --hostname=worker-low@%h
     volumes:
       - ./backend:/app
@@ -99,11 +140,17 @@ services:
       DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: dev-secret-change-me
+      IS_DEV: "true"
     depends_on:
       - worker-internal
 
   beat:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: celery -A app.celery_app beat --loglevel=info
     volumes:
       - ./backend:/app
@@ -111,11 +158,18 @@ services:
       DATABASE_URL: postgresql+psycopg2://pulse:pulse@postgres:5432/pulse
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: dev-secret-change-me
+      IS_DEV: "true"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   flower:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: celery -A app.celery_app flower --port=5555
     ports:
       - "5555:5555"
@@ -123,15 +177,33 @@ services:
       REDIS_URL: redis://redis:6379/0
     depends_on:
       - worker-internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5555/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      target: runner
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   pulse_pgdata:

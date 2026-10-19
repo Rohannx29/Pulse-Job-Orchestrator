@@ -6,17 +6,38 @@ This document focuses on the important keys and relationships so the diagram rem
 
 ![Pulse entity-relationship diagram](diagrams/er-diagram.png)
 
-*14 entities across auth, tenancy, scheduling, and execution. The self-referential `Job.depends_on_job_id` relationship is omitted from the rendered image for visual clarity — see [Dependencies](#dependencies) below.*
+*17 entities across auth, tenancy, RBAC, audit logging, scheduling, and execution. The self-referential `Job.depends_on_job_id` relationship is omitted from the rendered image for visual clarity — see [Dependencies](#dependencies) below.*
 
 ## How the model is organized
 
-### Ownership hierarchy
+### Tenancy and access hierarchy
 
 ```text
-User → Organization → Project → Queue
+User ──── owns ────> Organization ──> Project ──> Queue
+  │                        ▲
+  └──── member of ─────────┘ (via OrganizationMember: admin | member)
+
+Organization ── owns ──> InviteToken (single-use hashed token for employee onboarding)
+Organization ── owns ──> AuditLog (immutable trail of operator actions and mutations)
 ```
 
-Tenant-owned API resources follow this chain.
+Tenant-owned API resources follow this chain. Access is governed by the `OrganizationMember` authority table:
+- **`system_admin`** (platform operator): manages all organizations and users.
+- **`org_admin`** (organization admin): owns the org, invites members, manages projects and queues.
+- **`member`** (team member): submits, views, and explores jobs within the organization.
+
+### Audit logging
+
+```text
+AuditLog
+ ├── user_id (nullable actor reference)
+ ├── org_id (tenant boundary)
+ ├── action & resource_type
+ └── details (JSONB metadata)
+```
+
+Sensitive operator mutations (queue pause/resume, queue configuration edits, job retries, member invitations and removals, user role changes, schedule toggling) write an immutable record to `audit_logs`.
+
 
 ### Job state and execution history
 
@@ -50,6 +71,8 @@ Workers are shared execution infrastructure. A worker can execute many attempts,
 ## Important constraints
 
 - `users.email` is unique.
+- `(org_id, user_id)` is unique in `organization_members`.
+- `invite_tokens.token_hash` is unique.
 - Project names are unique within an organization.
 - Queue names are unique within a project.
 - Worker hostnames are unique.
@@ -58,6 +81,7 @@ Workers are shared execution infrastructure. A worker can execute many attempts,
 - Job submission idempotency is scoped by `(queue_id, idempotency_key)`.
 - `(queue_id, status)` is indexed for queue/job filtering.
 - Celery task IDs and other operational lookup fields are indexed.
+
 
 ## Updating the diagram
 

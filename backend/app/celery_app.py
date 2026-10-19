@@ -1,13 +1,35 @@
-from celery import Celery
+try:
+    from celery import Celery
+    HAS_CELERY = True
+except ImportError:
+    Celery = None
+    HAS_CELERY = False
 
 from app.config import settings
 
-celery_app = Celery(
-    "pulse",
-    broker=settings.REDIS_URL,
-    backend=settings.REDIS_URL,
-    include=["app.tasks"],
-)
+if HAS_CELERY:
+    celery_app = Celery(
+        "pulse",
+        broker=settings.REDIS_URL,
+        backend=settings.REDIS_URL,
+        include=["app.tasks"],
+    )
+else:
+    class _DummyCelery:
+        class _Conf:
+            def __init__(self):
+                self.beat_schedule = {}
+            def update(self, *args, **kwargs):
+                pass
+        def __init__(self):
+            self.conf = self._Conf()
+        def task(self, *args, **kwargs):
+            def decorator(fn):
+                fn.apply_async = lambda *a, **k: None
+                fn.delay = lambda *a, **k: None
+                return fn
+            return decorator
+    celery_app = _DummyCelery()
 
 celery_app.conf.update(
     task_serializer="json",
@@ -44,4 +66,36 @@ celery_app.conf.beat_schedule = {
         "schedule": 30.0,  # check every 30s for cron matches
         "options": {"queue": "pulse.internal"},
     },
+    "prune-stale-data": {
+        "task": "app.tasks.prune_stale_data",
+        "schedule": settings.PRUNE_INTERVAL_SECONDS,
+        "options": {"queue": "pulse.internal"},
+    },
 }
+
+# ---------------------------------------------------------------------------
+# Celery worker signals: structured JSON logging and correlation ID propagation
+# ---------------------------------------------------------------------------
+try:
+    from celery.signals import setup_logging as celery_setup_logging, task_postrun, task_prerun
+
+    @celery_setup_logging.connect
+    def on_celery_setup_logging(**kwargs):
+        if settings.LOG_FORMAT == "json":
+            from app.logging_config import setup_logging
+            setup_logging(service_name="pulse-worker", level=settings.LOG_LEVEL)
+
+    @task_prerun.connect
+    def on_task_prerun(task_id, task, *args, **kwargs):
+        from app.logging_config import set_correlation_id
+        headers = getattr(task.request, "headers", None) or {}
+        corr_id = headers.get("correlation_id") or task_id
+        set_correlation_id(corr_id)
+
+    @task_postrun.connect
+    def on_task_postrun(*args, **kwargs):
+        from app.logging_config import set_correlation_id
+        set_correlation_id("")
+except Exception:
+    pass
+
