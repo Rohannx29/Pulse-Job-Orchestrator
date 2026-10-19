@@ -527,6 +527,32 @@ Receivers verify authenticity using constant-time string comparison (`hmac.compa
 ### 20.3 Worker queue segregation & retry backoff
 Outbound webhook deliveries are routed exclusively to the internal management pool (`pulse.internal`), preventing third-party server latency or timeouts from blocking customer task queues (`pulse.high`, `pulse.normal`, `pulse.low`). Transient delivery failures (5xx HTTP status codes or connection timeouts) trigger exponential backoff retries (5s, 25s, 125s), while deterministic client errors (4xx) and SSRF violations fail immediately without retry.
 
+### 20.4 KMS secret encryption at rest & lifecycle
+Signing secrets (`whsec_...`) are never stored in plaintext in PostgreSQL:
+- **Authenticated AES Encryption**: Secrets are encrypted at rest using Fernet (AES-128-CBC with HMAC-SHA256 authentication).
+- **KMS Key Derivation**: The cryptographic key is supplied via `WEBHOOK_ENCRYPTION_KEY` or derived deterministically from `settings.SECRET_KEY` via SHA-256 HKDF-like construction (`pulse-kms-webhook-v1:`).
+- **Transparent Backwards Compatibility**: Encrypted secrets are prefixed with `enc:v1:`. Legacy unencrypted secrets stored prior to encryption remain readable without downtime or destructive database conversions.
+- **One-Time Exposure**: Raw signing secrets are returned in API responses exactly once upon creation (`WebhookSubscriptionCreateOut`) or rotation (`WebhookSecretRotateOut`). Subsequent `GET` or `LIST` operations return `WebhookSubscriptionOut` which completely omits the raw secret and provides only a masked preview (`whsec_••••••••••••••••`).
+
+### 20.5 Non-destructive secret rotation with dual-signing grace window
+Organizations can rotate compromised or aging webhook secrets without service interruption via `POST /orgs/me/webhooks/{subscription_id}/rotate-secret`:
+- **Grace Window**: The previous secret is retained in `previous_secret` with a configurable expiration timestamp (`previous_secret_expires_at`, default 3600s / 1 hour).
+- **Dual Signing**: While the grace period is active, outbound deliveries sign the payload with both the active and previous secrets:
+  - Header `X-Pulse-Signature`: `v1={current_sig},v1={previous_sig}`
+  - Header `X-Pulse-Signature-Previous`: `v1={previous_sig}`
+- **Consumer Verification**: Consumers can verify requests against either the new or old secret during the migration window, ensuring zero lost notifications during deployment.
+
+### 20.6 Webhook RBAC boundary & delivery redaction
+- **Strict Org-Admin RBAC**: Creating, updating, deleting, secret rotating, test pinging, and inspecting delivery logs are restricted strictly to `OrgAdmin` and `SystemAdmin` via `require_org_admin`. Regular members attempting any of these operations receive `403 Forbidden` and cannot read secrets or customer delivery payloads under any circumstances.
+- **Delivery Sanitization**: The `WebhookDeliveryOut` schema incorporates automatic Pydantic sanitization validators:
+  - **Payload Redaction**: Recursively redacts sensitive dictionary keys (`password`, `token`, `secret`, `api_key`, `access_token`, `refresh_token`, `authorization`, `private_key`) to `***REDACTED***`.
+  - **Response & Error Redaction**: Sanitizes Bearer tokens, raw webhook secrets, database connection URI credentials, and authentication strings from `response_body` and `error_message`.
+
+### 20.7 Centralized audited invitation service
+Member provisioning and invite token management are consolidated into a single authoritative domain service (`app.services.invitations.create_organization_invite`):
+- Both `/auth/invite` and `/orgs/me/invite` invoke this single service.
+- Validates active membership conflicts, invalidates stale pending invites for the recipient, hashes single-use tokens at rest, and logs a structured, audited `member.invite` event with unified metadata.
+
 ## 21. Multi-parent Directed Acyclic Graph (DAG) workflows
 
 Pulse provides enterprise workflow orchestration supporting arbitrary Directed Acyclic Graphs (DAGs) with multi-parent fan-in (synchronization barriers), multi-child fan-out (parallel branching), and complex diamond topologies:

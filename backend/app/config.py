@@ -20,6 +20,7 @@ class Settings:
     ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
     REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
     HEARTBEAT_INTERVAL_SECONDS: int = 15
+    WEBHOOK_ENCRYPTION_KEY: str | None = os.getenv("WEBHOOK_ENCRYPTION_KEY")
 
     # Structured logging
     LOG_FORMAT: str = os.getenv("LOG_FORMAT", "json")

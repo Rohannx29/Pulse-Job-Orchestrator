@@ -23,6 +23,8 @@ from urllib.request import Request as URLRequest, urlopen
 
 from sqlalchemy.orm import Session
 
+from app.kms import decrypt_webhook_secret
+from app.redaction import redact_sensitive_text
 from app.timeutils import utcnow
 from app.url_safety import validate_public_url
 
@@ -57,13 +59,17 @@ def verify_webhook_signature(
     payload_str: str,
     tolerance_seconds: int = 300,
 ) -> bool:
-    """Verifies that an incoming webhook signature is authentic and within time tolerance."""
+    """Verifies that an incoming webhook signature is authentic and within time tolerance.
+
+    Supports dual-signed headers (comma-separated signatures) during secret rotation.
+    """
     now = int(datetime.now(timezone.utc).timestamp())
     if abs(now - timestamp_header) > tolerance_seconds:
         return False
 
     expected_sig = sign_webhook_payload(secret, payload_str, timestamp_header)
-    return hmac.compare_digest(expected_sig, signature_header)
+    candidate_sigs = [s.strip() for s in signature_header.split(",") if s.strip()]
+    return any(hmac.compare_digest(expected_sig, cand) for cand in candidate_sigs)
 
 
 def dispatch_webhooks_for_event(
@@ -161,20 +167,34 @@ def execute_delivery(
         "data": delivery.payload,
     }
     payload_json = json.dumps(envelope, separators=(",", ":"), default=str)
-    signature = sign_webhook_payload(subscription.secret, payload_json, now_ts)
+    plain_secret = decrypt_webhook_secret(subscription.secret)
+    signature = sign_webhook_payload(plain_secret, payload_json, now_ts)
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Pulse-Webhook-Deliverer/1.0",
+        "X-Pulse-Signature": signature,
+        "X-Pulse-Timestamp": str(now_ts),
+        "X-Pulse-Event": delivery.event,
+        "X-Pulse-Delivery-ID": delivery.id,
+    }
+
+    # If previous secret exists and grace period is active, dual-sign for non-destructive rotation
+    if subscription.previous_secret and subscription.previous_secret_expires_at:
+        if subscription.previous_secret_expires_at > utcnow():
+            try:
+                prev_plain = decrypt_webhook_secret(subscription.previous_secret)
+                prev_sig = sign_webhook_payload(prev_plain, payload_json, now_ts)
+                headers["X-Pulse-Signature-Previous"] = prev_sig
+                headers["X-Pulse-Signature"] = f"{signature},{prev_sig}"
+            except Exception as exc:
+                logger.warning("Failed to sign with previous secret during grace window: %s", exc)
 
     req = URLRequest(
         url=subscription.url,
         data=payload_json.encode("utf-8"),
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Pulse-Webhook-Deliverer/1.0",
-            "X-Pulse-Signature": signature,
-            "X-Pulse-Timestamp": str(now_ts),
-            "X-Pulse-Event": delivery.event,
-            "X-Pulse-Delivery-ID": delivery.id,
-        },
+        headers=headers,
     )
 
     t0 = time.perf_counter()
@@ -205,8 +225,8 @@ def execute_delivery(
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
     delivery.status_code = status_code
-    delivery.response_body = response_body
-    delivery.error_message = error_message
+    delivery.response_body = redact_sensitive_text(response_body)
+    delivery.error_message = redact_sensitive_text(error_message)
     delivery.duration_ms = elapsed_ms
     delivery.is_success = is_success
     delivery.delivered_at = utcnow()

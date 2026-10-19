@@ -6,6 +6,7 @@ import {
   deleteWebhook,
   getWebhookDeliveries,
   getWebhooks,
+  rotateWebhookSecret,
   testWebhook,
   updateWebhook,
   WebhookDelivery,
@@ -35,8 +36,9 @@ export default function WebhooksPage() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<WebhookTestResponse | null>(null);
 
-  // Visible secrets map
+  // Visible secrets map and newly created/rotated raw secrets
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
+  const [sessionSecrets, setSessionSecrets] = useState<Record<string, string>>({});
 
   async function loadWebhooks() {
     try {
@@ -83,7 +85,8 @@ export default function WebhooksPage() {
         events: parsedEvents.length > 0 ? parsedEvents : ["*"],
         description: description.trim() || undefined,
       });
-      setSuccessMsg(`Webhook registered successfully with secret ${created.secret.slice(0, 10)}…`);
+      setSessionSecrets((prev) => ({ ...prev, [created.id]: created.secret }));
+      setSuccessMsg(`Webhook subscription created successfully with secret ${created.secret.slice(0, 10)}… (Store your secret safely)`);
       setUrl("");
       setDescription("");
       setEventsStr("*");
@@ -92,6 +95,20 @@ export default function WebhooksPage() {
       setError(err.message || "Failed to create webhook");
     } finally {
       setIsSubmitting(false);
+    }
+  }
+
+  async function handleRotateSecret(id: string) {
+    if (!confirm("Rotate webhook signing secret? The previous secret will remain valid for a 1-hour grace window.")) {
+      return;
+    }
+    try {
+      const rotated = await rotateWebhookSecret(id, 3600);
+      setSessionSecrets((prev) => ({ ...prev, [id]: rotated.secret }));
+      setSuccessMsg(`Signing secret rotated successfully: ${rotated.secret} (Previous secret remains valid for 1 hour grace window)`);
+      await loadWebhooks();
+    } catch (err: any) {
+      setError(err.message || "Failed to rotate secret");
     }
   }
 
@@ -317,7 +334,9 @@ export default function WebhooksPage() {
                   <td>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <code style={{ fontSize: 11 }}>
-                        {isRevealed ? sub.secret : `${sub.secret.slice(0, 10)}••••••••••••••••`}
+                        {isRevealed
+                          ? (sessionSecrets[sub.id] || sub.secret || sub.secret_preview)
+                          : (sub.secret_preview || "whsec_••••••••••••••••")}
                       </code>
                       <button
                         type="button"
@@ -352,6 +371,14 @@ export default function WebhooksPage() {
                   </td>
                   <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                     <button
+                      onClick={() => handleRotateSecret(sub.id)}
+                      className="btn"
+                      style={{ padding: "4px 8px", fontSize: 12, marginRight: 6 }}
+                      title="Rotate signing secret with 1-hour grace window"
+                    >
+                      Rotate
+                    </button>
+                    <button
                       onClick={() => handleTest(sub.id)}
                       disabled={testingId === sub.id}
                       className="btn"
@@ -370,7 +397,7 @@ export default function WebhooksPage() {
                         color: isSelected ? "var(--signal-blue)" : undefined,
                       }}
                     >
-                      Deliveries
+                      Logs
                     </button>
                     <button
                       onClick={() => handleDelete(sub.id)}

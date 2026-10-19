@@ -369,11 +369,36 @@ class WebhookSubscriptionOut(BaseModel):
     id: str
     org_id: str
     url: str
-    secret: str
+    secret_preview: str
     events: list[str]
     is_active: bool
     description: Optional[str] = None
     created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WebhookSubscriptionCreateOut(WebhookSubscriptionOut):
+    secret: str  # Raw HMAC signing secret, returned exactly once upon registration
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WebhookSecretRotateRequest(BaseModel):
+    grace_period_seconds: int = Field(
+        default=3600,
+        ge=0,
+        le=86400,
+        description="Grace window in seconds during which previous secret remains valid for signature verification.",
+    )
+
+
+class WebhookSecretRotateOut(BaseModel):
+    id: str
+    secret: str  # Raw new signing secret, returned exactly once upon rotation
+    secret_preview: str
+    previous_secret_valid_until: Optional[datetime] = None
+    message: str = "Store this secret safely. It will not be shown again."
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -392,6 +417,28 @@ class WebhookDeliveryOut(BaseModel):
     delivered_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("payload", mode="after")
+    @classmethod
+    def redact_payload(cls, v: dict[str, Any]) -> dict[str, Any]:
+        from app.redaction import redact_sensitive_dict
+        return redact_sensitive_dict(v)
+
+    @field_validator("response_body", mode="after")
+    @classmethod
+    def redact_response_body(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        from app.redaction import redact_sensitive_text
+        return redact_sensitive_text(v)
+
+    @field_validator("error_message", mode="after")
+    @classmethod
+    def redact_error_message(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        from app.redaction import redact_sensitive_text
+        return redact_sensitive_text(v)
 
 
 class WebhookTestResponse(BaseModel):

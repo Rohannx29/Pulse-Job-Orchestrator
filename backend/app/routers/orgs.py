@@ -12,6 +12,7 @@ from app.models import (
     User,
 )
 from app.schemas import InviteCreate, InviteOut, OrgMemberOut, OrgOut
+from app.services.invitations import create_organization_invite
 from app.security import create_refresh_token, hash_refresh_token
 from app.timeutils import utcnow
 
@@ -66,47 +67,12 @@ def invite_member(
     auth: tuple[User, Organization] = Depends(require_org_admin),
 ):
     user, org = auth
-
-    existing = (
-        db.query(User)
-        .join(OrganizationMember, User.id == OrganizationMember.user_id)
-        .filter(OrganizationMember.org_id == org.id, User.email == str(payload.email))
-        .first()
-    )
-    if existing:
-        raise HTTPException(status_code=409, detail="User is already a member of this organization")
-
-    # Invalidate any previous unused invites
-    db.query(InviteToken).filter(
-        InviteToken.org_id == org.id,
-        InviteToken.email == str(payload.email),
-        InviteToken.used_at.is_(None),
-    ).update({InviteToken.used_at: utcnow()}, synchronize_session=False)
-
-    raw_token = create_refresh_token()
-    expires_at = utcnow() + timedelta(hours=INVITE_EXPIRE_HOURS)
-
-    db.add(
-        InviteToken(
-            org_id=org.id,
-            invited_by_user_id=user.id,
-            email=str(payload.email),
-            token_hash=hash_refresh_token(raw_token),
-            expires_at=expires_at,
-        )
-    )
-    from app.audit import log_audit_event
-    log_audit_event(
+    raw_token, expires_at = create_organization_invite(
         db=db,
-        action="member.invite",
-        resource_type="organization",
-        resource_id=org.id,
-        user=user,
-        org_id=org.id,
-        details={"invited_email": str(payload.email)},
+        org=org,
+        actor_user=user,
+        email=str(payload.email),
     )
-    db.commit()
-
     return InviteOut(invite_token=raw_token, email=str(payload.email), expires_at=expires_at)
 
 

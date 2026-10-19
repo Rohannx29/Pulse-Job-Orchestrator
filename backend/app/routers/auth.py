@@ -28,6 +28,7 @@ from app.security import (
     hash_refresh_token,
     verify_password,
 )
+from app.services.invitations import create_organization_invite
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -231,36 +232,12 @@ def invite_member(
     The invite expires in 72 hours and is tied to the specific email address.
     """
     user, org = auth
-
-    # Check the target email isn't already a member
-    existing = (
-        db.query(User)
-        .join(OrganizationMember, User.id == OrganizationMember.user_id)
-        .filter(OrganizationMember.org_id == org.id, User.email == str(payload.email))
-        .first()
-    )
-    if existing:
-        raise HTTPException(status_code=409, detail="User is already a member of this organization")
-
-    # Invalidate any previous unused invites for the same email+org
-    db.query(InviteToken).filter(
-        InviteToken.org_id == org.id,
-        InviteToken.email == str(payload.email),
-        InviteToken.used_at.is_(None),
-    ).update({InviteToken.used_at: utcnow()}, synchronize_session=False)
-
-    raw_token = create_refresh_token()  # reuse the same secure random generator
-    expires_at = utcnow() + timedelta(hours=INVITE_EXPIRE_HOURS)
-
-    db.add(InviteToken(
-        org_id=org.id,
-        invited_by_user_id=user.id,
+    raw_token, expires_at = create_organization_invite(
+        db=db,
+        org=org,
+        actor_user=user,
         email=str(payload.email),
-        token_hash=hash_refresh_token(raw_token),
-        expires_at=expires_at,
-    ))
-    db.commit()
-
+    )
     return InviteOut(invite_token=raw_token, email=str(payload.email), expires_at=expires_at)
 
 

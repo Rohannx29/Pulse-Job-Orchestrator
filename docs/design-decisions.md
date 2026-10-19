@@ -1585,6 +1585,26 @@ Pulse uses **Playwright** (`frontend/e2e/`) to execute automated headless browse
 
 ---
 
+## 39. Webhook signing secret security, KMS encryption at rest, dual-signing rotation, and centralized invitation service
+
+### Decision
+
+Pulse hardens outbound webhook security and administrative authorization boundaries:
+1. **Schema Separation & Secret Non-exposure**: Splits `WebhookSubscriptionOut` into separate creation (`WebhookSubscriptionCreateOut`), rotation (`WebhookSecretRotateOut`), and read schemas (`WebhookSubscriptionOut`). Raw signing secrets are returned strictly once upon creation or rotation; `GET` and `LIST` endpoints never expose raw secrets, returning only masked previews (`whsec_••••••••••••••••`).
+2. **KMS Encryption at Rest (`app.kms`)**: All signing secrets stored in PostgreSQL are encrypted using Fernet (AES-128-CBC with HMAC-SHA256 authenticated encryption), keyed via `WEBHOOK_ENCRYPTION_KEY` or derived from `settings.SECRET_KEY`. Legacy unencrypted rows decrypt transparently for zero-downtime backwards compatibility.
+3. **Non-Destructive Secret Rotation with Dual-Signing Grace Windows**: Introduces `POST /orgs/me/webhooks/{id}/rotate-secret` with configurable grace windows (`previous_secret_expires_at`). Outbound deliveries during the grace window include both active and previous signatures (`X-Pulse-Signature` and `X-Pulse-Signature-Previous`), permitting consumers to transition verification credentials without dropping notifications.
+4. **Org-Admin Authorization Boundary & Automatic Delivery Redaction**: Restricts webhook management and delivery log inspection strictly to `OrgAdmin` and `SystemAdmin` (`require_org_admin`). Automatically sanitizes sensitive credentials (`password`, `token`, `secret`, `api_key`, `access_token`, `refresh_token`, `authorization`) and connection URIs from delivery payloads and response bodies (`app.redaction`).
+5. **Centralized Audited Invitation Service (`app.services.invitations`)**: Unifies duplicate invite generation from `/auth/invite` and `/orgs/me/invite` into a single authoritative service with duplicate prevention, token hashing, and consistent `action="member.invite"` audit records.
+
+### Why
+
+1. **Defense in Depth Against Secret Leaks**: Webhook secrets are shared cryptographic keys. Exposing them in general read APIs, log dumps, or unprivileged database snapshots allows malicious actors to forge arbitrary platform events or tamper with customer systems.
+2. **Elimination of Rotation Outages**: Immediate revocation during secret rotation forces customer webhook receivers to update credentials simultaneously with Pulse, inevitably dropping delivery packets. A dual-signing grace window enables zero-downtime rotation.
+3. **Tenant & Privilege Isolation**: Regular organization members must not inspect customer webhook traffic, read delivery payloads (which may contain internal business data), or reconfigure endpoints.
+4. **Audit Consistency**: Disjoint invitation endpoints without shared audit formats create compliance blindspots during member provisioning.
+
+---
+
 ## Decision summary
 
 | Area | Chosen approach | Main reason |
@@ -1614,6 +1634,8 @@ Pulse uses **Playwright** (`frontend/e2e/`) to execute automated headless browse
 | Container security & multi-stage | Builder/runtime separation + non-root UID 10001/1001 + `no-new-privileges` | Eliminates compilers from runtime, reduces image size, and prevents root escalation |
 | Data retention & pruning | Chunked batch deletes + `pulse.internal` + Redis lock + audit trail | Eliminates table bloat and WAL spikes without blocking concurrent workloads |
 | Outbound webhooks & signatures | HMAC-SHA256 (`whsec_...`) + SSRF validation + `pulse.internal` + delivery auditing | Cryptographic authenticity, replay prevention, and control-plane isolation |
+| Webhook secret hardening & KMS | AES-128 KMS encryption at rest + dual-signing rotation grace + delivery redaction + Org-Admin RBAC | Prevents key compromise, zero-downtime rotation, and protects delivery payload confidentiality |
+| Centralized invitations | Shared domain service `create_organization_invite` | Guarantees identical audit event format and single-use token lifecycle |
 | CI/CD & multi-arch delivery | GitHub Actions + ephemeral services + Buildx QEMU | Automated verification across PostgreSQL 16 & Redis 7 with AMD64/ARM64 container images |
 | End-to-end browser testing | Playwright + isolated browser contexts + Next.js webServer | Real browser verification of auth cookies, queue controls, DAG graphs, and webhooks |
 

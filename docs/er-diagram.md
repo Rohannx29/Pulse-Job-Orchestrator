@@ -95,8 +95,8 @@ Organization ── owns ──> WebhookSubscription × N
                              └── owns ──> WebhookDelivery × N
 ```
 
-- **`WebhookSubscription`**: Scoped to an `organization_id`. Stores the destination `url`, cryptographic HMAC signing `secret` (`whsec_...`), subscribed `events` array (e.g. `["*"]` or `["job.completed", "job.failed"]`), `is_active` boolean, and optional description.
-- **`WebhookDelivery`**: Audit log of each outbound dispatch attempt linked to `subscription_id` with `event`, request `payload`, HTTP `status_code`, truncated `response_body` (capped at 2KB), `error_message`, execution `duration_ms`, `attempt_number`, and `is_success`. Cascades on subscription deletion.
+- **`WebhookSubscription`**: Scoped to an `organization_id`. Stores the destination `url`, KMS-encrypted signing `secret` (VARCHAR 512, `enc:v1:...`), optional `previous_secret` (VARCHAR 512, `enc:v1:...`) and `previous_secret_expires_at` (TIMESTAMP) for dual-signing rotation grace periods, subscribed `events` array (e.g. `["*"]` or `["job.completed", "job.failed"]`), `is_active` boolean, and optional description.
+- **`WebhookDelivery`**: Audit log of each outbound dispatch attempt linked to `subscription_id` with `event`, redacted request `payload`, HTTP `status_code`, sanitized `response_body` (capped at 2KB), sanitized `error_message`, execution `duration_ms`, `attempt_number`, and `is_success`. Cascades on subscription deletion.
 
 ## Important constraints
 

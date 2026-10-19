@@ -60,7 +60,7 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Prometheus metrics & deep healthchecks | ✅ | Prometheus format (0.0.4) exposition (`/metrics`), deep readiness probe (`/health`), and liveness probe (`/health/live`) |
 | Production deployment hardening | ✅ | Multi-stage Docker builds, non-root users (`pulse:pulse`, `nextjs:nodejs`), `no-new-privileges`, healthchecks, restart policies |
 | Data retention & table pruning | ✅ | Automated Celery Beat batch pruning (`pulse.internal`) & admin trigger (`POST /admin/prune`) for heartbeats, logs, executions, and terminal jobs |
-| Outbound Webhooks & HMAC Signatures | ✅ | Cryptographic HMAC-SHA256 (`whsec_...`), replay attack tolerance window, SSRF protection, Celery delivery worker (`pulse.internal`), and delivery logs |
+| Outbound Webhooks & Secret Hardening | ✅ | Cryptographic HMAC-SHA256 (`whsec_...`), KMS encryption at rest (Fernet), dual-signing rotation grace window, automatic delivery redaction, SSRF protection, Celery delivery worker (`pulse.internal`), and strict Org-Admin RBAC boundary |
 | CI/CD & Multi-Arch Container Builds | ✅ | GitHub Actions workflow with PostgreSQL 16 & Redis 7 service containers, Ruff linting, coverage reporting, Next.js build verification, Docker Compose smoke tests, and Buildx multi-arch images (`linux/amd64`, `linux/arm64`) |
 | End-to-End Testing (Playwright) | ✅ | Automated browser test suite covering registration, auth lifecycle, project/queue management, multi-parent DAG workflow inspection, outbound webhooks, and audit logs |
 
@@ -72,40 +72,45 @@ pulse/
 ├── README.md
 ├── docker-compose.yml
 ├── .github/
+│   ├── dependabot.yml         # Automated dependency vulnerability scanning
 │   └── workflows/
-│       └── ci.yml                 # Automated testing, linting, Next.js build & multi-arch container delivery
+│       └── ci.yml             # Automated testing, linting, Next.js build & multi-arch container delivery
 │
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── alembic.ini
 │   ├── alembic/
-│   │   └── versions/              # database migrations
+│   │   └── versions/          # database migrations
 │   ├── app/
-│   │   ├── main.py                # FastAPI application
-│   │   ├── config.py              # environment-backed settings
-│   │   ├── database.py             # SQLAlchemy engine/session
-│   │   ├── models.py               # database models
-│   │   ├── schemas.py              # Pydantic API schemas
-│   │   ├── security.py             # password/token helpers
-│   │   ├── celery_app.py           # Celery configuration
-│   │   ├── dispatch.py             # common job-dispatch path
-│   │   ├── tasks.py                # execution/retry/DLQ/cron/heartbeat/webhooks
-│   │   ├── priority.py             # priority → Celery queue mapping
-│   │   ├── concurrency.py          # Redis queue semaphore
-│   │   ├── worker_registry.py      # worker identity/lifecycle
-│   │   ├── url_safety.py           # SSRF protections
-│   │   ├── audit.py                # immutable audit logging helper
-│   │   ├── events.py               # Redis Pub/Sub real-time event publisher
-│   │   ├── webhooks.py             # Outbound webhook signing, SSRF validation & delivery engine
-│   │   ├── dag.py                  # Multi-parent DAG engine, DFS cycle detection & join resolution
-│   │   ├── rate_limiter.py         # Redis sliding-window rate limiter
-│   │   ├── auth_hardening.py       # account lockout and brute-force defenses
-│   │   ├── logging_config.py       # structured JSON logging & correlation IDs
-│   │   ├── metrics.py              # Prometheus metrics registry, gauges & collectors
-│   │   ├── retention.py            # automated batch data retention & table pruning
-│   │   └── routers/                # API route modules (jobs, queues, dlq, schedules, workers, projects, orgs, webhooks, admin, audit, events, health, auth)
-│   └── tests/                      # unit + integration tests
+│   │   ├── main.py            # FastAPI application
+│   │   ├── config.py          # environment-backed settings
+│   │   ├── database.py        # SQLAlchemy engine/session
+│   │   ├── models.py          # database models
+│   │   ├── schemas.py         # Pydantic API schemas
+│   │   ├── security.py        # password/token helpers
+│   │   ├── kms.py             # KMS secret encryption at rest & masking
+│   │   ├── redaction.py       # secret sanitization & delivery log redaction
+│   │   ├── celery_app.py      # Celery configuration
+│   │   ├── dispatch.py        # common job-dispatch path
+│   │   ├── tasks.py           # execution/retry/DLQ/cron/heartbeat/webhooks
+│   │   ├── priority.py        # priority → Celery queue mapping
+│   │   ├── concurrency.py     # Redis queue semaphore
+│   │   ├── worker_registry.py # worker identity/lifecycle
+│   │   ├── url_safety.py      # SSRF protections
+│   │   ├── audit.py           # immutable audit logging helper
+│   │   ├── events.py          # Redis Pub/Sub real-time event publisher
+│   │   ├── webhooks.py        # Outbound webhook signing, SSRF validation & delivery engine
+│   │   ├── dag.py             # Multi-parent DAG engine, DFS cycle detection & join resolution
+│   │   ├── rate_limiter.py    # Redis sliding-window rate limiter
+│   │   ├── auth_hardening.py  # account lockout and brute-force defenses
+│   │   ├── logging_config.py  # structured JSON logging & correlation IDs
+│   │   ├── metrics.py         # Prometheus metrics registry, gauges & collectors
+│   │   ├── retention.py       # automated batch data retention & table pruning
+│   │   ├── services/          # domain services (invitations, provisioning)
+│   │   │   └── invitations.py # centralized audited organization invitation service
+│   │   └── routers/           # API route modules (jobs, queues, dlq, schedules, workers, projects, orgs, webhooks, admin, audit, events, health, auth)
+│   └── tests/                 # unit + integration tests
 │
 ├── frontend/
 │   ├── app/                        # Next.js routes/pages (dashboard, jobs, queues, schedules, workers, dlq, webhooks, projects, team, admin, audit-logs, auth)
@@ -345,22 +350,23 @@ celery -A app.celery_app beat --loglevel=info
 
 ## Testing
 
-The repository contains **31 test functions across 8 test modules**, covering retry math, priority mapping, concurrency, dependencies, cookie authentication, security, URL safety, and related integration behavior.
+The backend test suite contains **84 test cases across 17 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, cookie authentication, security, URL safety, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, and retention pruning. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
 
-Run:
+Run backend tests:
 
 ```bash
 cd backend
-pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
-For a targeted test:
+Targeted test suites:
 
 ```bash
-pytest tests/test_concurrency.py -v
-pytest tests/test_priority.py -v
-pytest tests/test_dependencies.py -v
-pytest tests/test_cookie_auth_integration.py -v
+python -m pytest tests/test_webhook_rbac.py -v
+python -m pytest tests/test_webhooks.py -v
+python -m pytest tests/test_dag.py -v
+python -m pytest tests/test_dependencies.py -v
+python -m pytest tests/test_cookie_auth_integration.py -v
 ```
 
 Integration tests require the dependencies specified by the project and, where applicable, real PostgreSQL/Redis services. A test that cannot collect because dependencies are absent is an environment/setup failure, not evidence that the application logic passed.

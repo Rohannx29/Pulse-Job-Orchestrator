@@ -1,8 +1,9 @@
-"""REST API Router for managing Outbound Webhooks and viewing delivery logs."""
+"""REST API Router for managing Outbound Webhooks, secret rotation, and viewing delivery logs."""
 
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,11 +11,15 @@ from sqlalchemy.orm import Session
 
 from app.audit import log_audit_event
 from app.database import get_db
-from app.deps import get_current_user, get_user_org, require_org_admin
+from app.deps import require_org_admin
+from app.kms import encrypt_webhook_secret, mask_webhook_secret
 from app.models import Organization, User, WebhookDelivery, WebhookSubscription
 from app.schemas import (
     WebhookDeliveryOut,
+    WebhookSecretRotateRequest,
+    WebhookSecretRotateOut,
     WebhookSubscriptionCreate,
+    WebhookSubscriptionCreateOut,
     WebhookSubscriptionOut,
     WebhookSubscriptionUpdate,
     WebhookTestResponse,
@@ -28,13 +33,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/orgs/me/webhooks", tags=["webhooks"])
 
 
-@router.post("", response_model=WebhookSubscriptionOut, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=WebhookSubscriptionCreateOut, status_code=status.HTTP_201_CREATED)
 def create_webhook_subscription(
     payload: WebhookSubscriptionCreate,
     db: Session = Depends(get_db),
     auth: tuple[User, Organization] = Depends(require_org_admin),
 ):
-    """Register a new outbound webhook endpoint for the organization."""
+    """Register a new outbound webhook endpoint for the organization.
+
+    Generates an HMAC-SHA256 signing secret, encrypts it at rest via KMS,
+    and returns the raw secret exactly once in the response.
+    """
     user, org = auth
 
     # 1. Enforce strict SSRF check on user-supplied URL
@@ -46,13 +55,14 @@ def create_webhook_subscription(
             detail=f"Invalid webhook URL: {exc}",
         )
 
-    # 2. Generate cryptographic HMAC signing secret
-    secret = generate_webhook_secret()
+    # 2. Generate cryptographic HMAC signing secret and encrypt at rest
+    raw_secret = generate_webhook_secret()
+    encrypted_secret = encrypt_webhook_secret(raw_secret)
 
     subscription = WebhookSubscription(
         org_id=org.id,
         url=payload.url,
-        secret=secret,
+        secret=encrypted_secret,
         events=payload.events or ["*"],
         description=payload.description,
         is_active=True,
@@ -72,16 +82,26 @@ def create_webhook_subscription(
     db.commit()
     db.refresh(subscription)
 
-    return subscription
+    return WebhookSubscriptionCreateOut(
+        id=subscription.id,
+        org_id=subscription.org_id,
+        url=subscription.url,
+        secret=raw_secret,
+        secret_preview=subscription.secret_preview,
+        events=subscription.events,
+        is_active=subscription.is_active,
+        description=subscription.description,
+        created_at=subscription.created_at,
+    )
 
 
 @router.get("", response_model=List[WebhookSubscriptionOut])
 def list_webhook_subscriptions(
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    auth: tuple[User, Organization] = Depends(require_org_admin),
 ):
-    """List all webhook subscriptions registered for the organization."""
-    org = get_user_org(db, user)
+    """List all webhook subscriptions for the organization. Never exposes signing secrets."""
+    _, org = auth
     return (
         db.query(WebhookSubscription)
         .filter(WebhookSubscription.org_id == org.id)
@@ -94,10 +114,10 @@ def list_webhook_subscriptions(
 def get_webhook_subscription(
     subscription_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    auth: tuple[User, Organization] = Depends(require_org_admin),
 ):
-    """Get details of a specific webhook subscription."""
-    org = get_user_org(db, user)
+    """Get details of a specific webhook subscription. Never exposes signing secrets."""
+    _, org = auth
     subscription = db.get(WebhookSubscription, subscription_id)
     if not subscription or subscription.org_id != org.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook subscription not found")
@@ -153,6 +173,63 @@ def update_webhook_subscription(
     db.refresh(subscription)
 
     return subscription
+
+
+@router.post("/{subscription_id}/rotate-secret", response_model=WebhookSecretRotateOut)
+def rotate_webhook_secret(
+    subscription_id: str,
+    payload: Optional[WebhookSecretRotateRequest] = None,
+    db: Session = Depends(get_db),
+    auth: tuple[User, Organization] = Depends(require_org_admin),
+):
+    """Rotates the signing secret for an existing webhook subscription.
+
+    Non-destructively retains the previous secret for a configurable grace period,
+    allowing clients to transition credentials without downtime. The new raw secret
+    is returned exactly once.
+    """
+    user, org = auth
+    subscription = db.get(WebhookSubscription, subscription_id)
+    if not subscription or subscription.org_id != org.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook subscription not found")
+
+    grace_seconds = payload.grace_period_seconds if payload else 3600
+    new_raw_secret = generate_webhook_secret()
+    new_encrypted = encrypt_webhook_secret(new_raw_secret)
+
+    # Retain old secret during grace period for dual signing / validation
+    subscription.previous_secret = subscription.secret
+    subscription.previous_secret_expires_at = (
+        utcnow() + timedelta(seconds=grace_seconds) if grace_seconds > 0 else None
+    )
+    subscription.secret = new_encrypted
+
+    log_audit_event(
+        db=db,
+        action="webhook.rotate_secret",
+        resource_type="webhook_subscription",
+        resource_id=subscription.id,
+        user=user,
+        org_id=org.id,
+        details={
+            "url": subscription.url,
+            "grace_period_seconds": grace_seconds,
+            "previous_secret_valid_until": (
+                subscription.previous_secret_expires_at.isoformat()
+                if subscription.previous_secret_expires_at
+                else None
+            ),
+        },
+    )
+    db.commit()
+    db.refresh(subscription)
+
+    return WebhookSecretRotateOut(
+        id=subscription.id,
+        secret=new_raw_secret,
+        secret_preview=mask_webhook_secret(new_raw_secret),
+        previous_secret_valid_until=subscription.previous_secret_expires_at,
+    )
 
 
 @router.delete("/{subscription_id}")
@@ -229,10 +306,10 @@ def list_webhook_deliveries(
     subscription_id: str,
     limit: int = Query(50, ge=1, le=100),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    auth: tuple[User, Organization] = Depends(require_org_admin),
 ):
-    """List recent delivery attempts for a webhook subscription."""
-    org = get_user_org(db, user)
+    """List recent delivery attempts for a webhook subscription with redacted payload/response bodies."""
+    _, org = auth
     subscription = db.get(WebhookSubscription, subscription_id)
     if not subscription or subscription.org_id != org.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook subscription not found")

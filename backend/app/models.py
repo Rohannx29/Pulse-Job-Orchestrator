@@ -389,7 +389,9 @@ class WebhookSubscription(Base):
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     org_id = Column(UUID(as_uuid=False), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
     url = Column(String(2048), nullable=False)
-    secret = Column(String(255), nullable=False)  # Cryptographically random HMAC-SHA256 signing secret
+    secret = Column(String(512), nullable=False)  # Encrypted HMAC signing secret at rest
+    previous_secret = Column(String(512), nullable=True)  # Previous encrypted secret during rotation grace period
+    previous_secret_expires_at = Column(DateTime, nullable=True)  # Expiration for previous secret grace period
     events = Column(JSONB, nullable=False, default=list)  # e.g. ["job.completed", "job.failed", "job.dead_letter"] or ["*"]
     is_active = Column(Boolean, default=True, nullable=False)
     description = Column(String(255), nullable=True)
@@ -397,6 +399,12 @@ class WebhookSubscription(Base):
 
     organization = relationship("Organization", back_populates="webhook_subscriptions")
     deliveries = relationship("WebhookDelivery", back_populates="subscription", cascade="all, delete-orphan")
+
+    @property
+    def secret_preview(self) -> str:
+        """Returns safe preview for UI/API listing without revealing the raw secret."""
+        from app.kms import mask_webhook_secret
+        return mask_webhook_secret(self.secret)
 
 
 class WebhookDelivery(Base):

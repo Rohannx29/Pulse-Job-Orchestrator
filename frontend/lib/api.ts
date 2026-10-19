@@ -299,11 +299,24 @@ export interface WebhookSubscription {
   id: string;
   org_id: string;
   url: string;
-  secret: string;
+  secret?: string | null;
+  secret_preview: string;
   events: string[];
   is_active: boolean;
   description?: string | null;
   created_at: string;
+}
+
+export interface WebhookSubscriptionCreateOut extends WebhookSubscription {
+  secret: string;
+}
+
+export interface WebhookSecretRotateOut {
+  id: string;
+  secret: string;
+  secret_preview: string;
+  previous_secret_valid_until?: string | null;
+  message: string;
 }
 
 export interface WebhookDelivery {
@@ -336,10 +349,20 @@ export async function createWebhook(data: {
   url: string;
   events?: string[];
   description?: string;
-}): Promise<WebhookSubscription> {
-  return api<WebhookSubscription>("/orgs/me/webhooks", {
+}): Promise<WebhookSubscriptionCreateOut> {
+  return api<WebhookSubscriptionCreateOut>("/orgs/me/webhooks", {
     method: "POST",
     body: JSON.stringify(data),
+  });
+}
+
+export async function rotateWebhookSecret(
+  id: string,
+  grace_period_seconds?: number
+): Promise<WebhookSecretRotateOut> {
+  return api<WebhookSecretRotateOut>(`/orgs/me/webhooks/${id}/rotate-secret`, {
+    method: "POST",
+    body: JSON.stringify({ grace_period_seconds: grace_period_seconds ?? 3600 }),
   });
 }
 
