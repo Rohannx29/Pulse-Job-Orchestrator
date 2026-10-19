@@ -22,6 +22,7 @@ from app.timeutils import utcnow
 from app.config import settings
 from app.database import SessionLocal
 from app.dispatch import dispatch_job
+import uuid
 from app.events import get_job_org_id, publish_event
 from app.models import (
     DeadLetterJob,
@@ -31,9 +32,11 @@ from app.models import (
     JobSchedule,
     JobStatus,
     LogLevel,
+    OutboxEvent,
     Queue,
     RetryPolicy,
     RetryStrategy,
+    ScheduleOccurrence,
     Worker,
     WorkerHeartbeat,
     WorkerStatus,
@@ -372,22 +375,37 @@ def sync_worker_heartbeats():
         db.close()
 
 
+LUA_SAFE_RELEASE_LOCK = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+
 @celery_app.task(name="app.tasks.dispatch_due_schedules")
 def dispatch_due_schedules():
-    """Runs on a Beat interval. Evaluates each active JobSchedule's cron
-    expression and creates a new Job row (+ dispatches it) whenever a
-    scheduled tick has been crossed since the last check.
+    """Runs on a Beat interval. Evaluates active JobSchedule cron expressions and
+    creates a new Job row (+ dispatches it via Transactional Outbox) when due.
 
-    Guarded by a short-lived Redis lock: if a run takes longer than the
-    30s Beat interval (e.g. many schedules, slow DB), Beat will still fire
-    the next tick on schedule regardless of whether the first run
-    finished. Without the lock, two overlapping runs could both see the
-    same schedule as "due" (neither has updated last_dispatched_at yet)
-    and both create a Job for it — a real duplicate-dispatch risk, not a
-    hypothetical one, given Beat doesn't wait for task completion."""
-    have_lock = _redis.set("pulse:lock:dispatch_due_schedules", "1", nx=True, ex=25)
+    Hardened guarantees:
+    - Owned Redis lock with random UUID token and safe atomic Lua compare-and-delete.
+    - Unique ScheduleOccurrence record keyed by (schedule_id, scheduled_fire_time) prevents
+      duplicate jobs across overlapping Beat runs or worker crashes.
+    - Fails closed per-schedule on malformed cron syntax (disables schedule + logs audit event),
+      allowing healthy schedules to continue processing.
+    """
+    owner_token = str(uuid.uuid4())
+    have_lock = False
+    try:
+        have_lock = bool(_redis.set("pulse:lock:dispatch_due_schedules", owner_token, nx=True, ex=30))
+    except Exception as exc:
+        logger.warning("Redis connection error acquiring schedule lock: %s", exc)
+        have_lock = False
+
     if not have_lock:
-        logger.info("dispatch_due_schedules already running, skipping this tick")
+        logger.info("dispatch_due_schedules already running or lock held, skipping this tick")
         return
 
     db = SessionLocal()
@@ -395,31 +413,111 @@ def dispatch_due_schedules():
         now = utcnow()
         schedules = db.query(JobSchedule).filter(JobSchedule.is_active.is_(True)).all()
         for schedule in schedules:
-            base = schedule.last_dispatched_at or (now - timedelta(minutes=5))
-            cron = croniter(schedule.cron_expression, base)
-            next_fire = cron.get_next(datetime)
-            if next_fire > now:
-                continue  # not due yet
+            try:
+                # 1. Fail closed on malformed legacy schedules
+                if not croniter or not croniter.is_valid(schedule.cron_expression):
+                    logger.error(
+                        "Schedule %s has invalid cron expression '%s'. Disabling schedule.",
+                        schedule.id,
+                        schedule.cron_expression,
+                    )
+                    schedule.is_active = False
+                    from app.audit import log_audit_event
+                    log_audit_event(
+                        db=db,
+                        action="schedule.invalid_disabled",
+                        resource_type="job_schedule",
+                        resource_id=schedule.id,
+                        user=None,
+                        org_id=(
+                            schedule.queue.project.org_id
+                            if (schedule.queue and schedule.queue.project)
+                            else None
+                        ),
+                        details={
+                            "cron_expression": schedule.cron_expression,
+                            "error": "Invalid cron syntax",
+                        },
+                    )
+                    db.commit()
+                    continue
 
-            job = Job(
-                queue_id=schedule.queue_id,
-                schedule_id=schedule.id,
-                name=f"{schedule.name} ({next_fire.isoformat()})",
-                payload=dict(schedule.payload_template),
-                status=JobStatus.QUEUED,
-                priority=schedule.queue.priority,
-            )
-            db.add(job)
-            db.flush()
-            schedule.last_dispatched_at = now
-            db.commit()  # job row visible before it can possibly be dispatched
+                # 2. Base reference time and next scheduled fire time in UTC
+                base = schedule.last_dispatched_at or (now - timedelta(minutes=5))
+                cron = croniter(schedule.cron_expression, base)
+                next_fire = cron.get_next(datetime)
 
-            dispatch_job(job)
-            db.commit()
-            logger.info("Dispatched scheduled job %s from schedule %s", job.id, schedule.id)
+                if next_fire > now:
+                    continue  # Not due yet
+
+                # 3. Persist ScheduleOccurrence to guarantee exactly-once execution per fire time
+                occurrence = ScheduleOccurrence(
+                    schedule_id=schedule.id,
+                    scheduled_fire_time=next_fire,
+                    dispatched_at=now,
+                )
+                db.add(occurrence)
+                try:
+                    db.flush()
+                except Exception:
+                    # Duplicate occurrence for this fire time already dispatched
+                    db.rollback()
+                    logger.info(
+                        "Schedule %s fire time %s already claimed by concurrent runner. Skipping.",
+                        schedule.id,
+                        next_fire,
+                    )
+                    continue
+
+                # 4. Create Job row atomically linked to the occurrence
+                job = Job(
+                    queue_id=schedule.queue_id,
+                    schedule_id=schedule.id,
+                    name=f"{schedule.name} ({next_fire.isoformat()})",
+                    payload=dict(schedule.payload_template),
+                    status=JobStatus.QUEUED,
+                    priority=schedule.queue.priority if schedule.queue else 5,
+                )
+                db.add(job)
+                db.flush()
+
+                occurrence.dispatched_job_id = job.id
+                schedule.last_dispatched_at = now
+                db.commit()
+
+                # 5. Dispatch via Transactional Outbox
+                dispatch_job(job, db=db)
+                logger.info(
+                    "Dispatched scheduled job %s from schedule %s for fire time %s",
+                    job.id,
+                    schedule.id,
+                    next_fire,
+                )
+
+            except Exception as sched_exc:
+                logger.error("Error processing schedule %s: %s", schedule.id, sched_exc)
+                db.rollback()
+                continue
     finally:
         db.close()
-        _redis.delete("pulse:lock:dispatch_due_schedules")
+        try:
+            _redis.eval(LUA_SAFE_RELEASE_LOCK, 1, "pulse:lock:dispatch_due_schedules", owner_token)
+        except Exception:
+            pass
+
+
+@celery_app.task(name="app.tasks.process_outbox_events")
+def process_outbox_events():
+    """Runs on a Beat interval. Polls and dispatches pending Transactional Outbox events."""
+    from app.outbox import publish_pending_outbox_events
+
+    db = SessionLocal()
+    try:
+        dispatched = publish_pending_outbox_events(db, batch_size=50)
+        if dispatched > 0:
+            logger.info("Outbox publisher dispatched %d pending events", dispatched)
+    finally:
+        db.close()
 
 
 @celery_app.task(name="app.tasks.prune_stale_data")

@@ -295,6 +295,15 @@ class JobScheduleCreate(BaseModel):
     cron_expression: str
     payload_template: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("cron_expression")
+    @classmethod
+    def validate_cron_syntax(cls, v: str) -> str:
+        clean = v.strip()
+        from croniter import croniter
+        if not croniter.is_valid(clean):
+            raise ValueError(f"Invalid cron expression '{v}'. Must be a standard 5-field cron expression evaluated in UTC.")
+        return clean
+
 
 class JobScheduleOut(BaseModel):
     id: str

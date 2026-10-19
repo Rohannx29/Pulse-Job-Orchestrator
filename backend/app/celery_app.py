@@ -28,6 +28,8 @@ else:
         def __init__(self):
             self.conf = self._Conf()
             self.control = _DummyControl()
+        def send_task(self, *args, **kwargs):
+            return None
         def task(self, *args, **kwargs):
             bind = kwargs.get("bind", False)
             max_retries = kwargs.get("max_retries", 3)

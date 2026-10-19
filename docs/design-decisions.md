@@ -46,6 +46,8 @@
 36. [Multi-parent directed acyclic graph (DAG) workflows and cycle detection](#36-multi-parent-directed-acyclic-graph-dag-workflows-and-cycle-detection)
 37. [Automated multi-stage CI/CD with matrix testing and multi-architecture container builds](#37-automated-multi-stage-cicd-with-matrix-testing-and-multi-architecture-container-builds)
 38. [End-to-end browser testing with Playwright and synthetic operator journeys](#38-end-to-end-browser-testing-with-playwright-and-synthetic-operator-journeys)
+39. [Webhook signing secret security, KMS encryption at rest, dual-signing rotation, and centralized invitation service](#39-webhook-signing-secret-security-kms-encryption-at-rest-dual-signing-rotation-and-centralized-invitation-service)
+40. [Transactional Outbox pattern, atomic DAG fan-in resolution, and hardened schedule occurrence deduplication](#40-transactional-outbox-pattern-atomic-dag-fan-in-resolution-and-hardened-schedule-occurrence-deduplication)
 
 ---
 
@@ -1605,6 +1607,39 @@ Pulse hardens outbound webhook security and administrative authorization boundar
 
 ---
 
+## 40. Transactional Outbox pattern, atomic DAG fan-in resolution, and hardened schedule occurrence deduplication
+
+### Decision
+
+Pulse introduces durable transaction-safe event publication and race-free dispatch guarantees across the entire lifecycle:
+
+1. **Transactional Outbox Table (`outbox_events`)**:
+   - Whenever a job state transition occurs that requires external network activity (enqueuing a Celery task, publishing an SSE event over Redis Pub/Sub, or triggering an outbound webhook delivery), the event is recorded in PostgreSQL as an `OutboxEvent` within the *same* database transaction as the primary aggregate.
+   - Outbox rows feature immutable event IDs, aggregate types (`job`, `organization`, `webhook_delivery`), aggregate IDs, structured payloads, UTC created timestamps, and deterministic fencing keys (e.g. `job:dispatch:<job_id>:<retry_count>`).
+2. **Post-Commit Publication & Idempotent Polling Publisher (`app.outbox`)**:
+   - External dispatch is only attempted after the database transaction successfully commits.
+   - If the request transaction aborts, rolls back, or the API server crashes midway, no phantom work is ever published.
+   - A dedicated Beat housekeeping task (`process_outbox_events` on `pulse.internal`) claims pending outbox rows using row-level locking (`SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL) with bounded retries (`MAX_OUTBOX_RETRIES = 5`) and backoff error logging, preventing publisher workers from duplicate-claiming or deadlocking.
+3. **Atomic DAG Fan-In Resolution (`app.dag`)**:
+   - In multi-parent DAG diamond workflows where $M$ prerequisite parents complete concurrently, the join evaluation uses an atomic conditional database update:
+     ```sql
+     UPDATE jobs SET status = 'QUEUED' WHERE id = :id AND status = 'BLOCKED'
+     ```
+   - Only the single winning thread where `rowcount == 1` records the dispatch event and triggers Celery dispatch. Losers where `rowcount == 0` immediately exit, completely eliminating duplicate execution under concurrent fan-in completions.
+4. **Hardened Schedule Deduplication & Safe Lock Release (`app.tasks`)**:
+   - Evaluates cron syntax on write via `croniter.is_valid` with strict UTC normalization.
+   - Uses an owned Redis mutex with random UUID tokens and safe atomic Lua compare-and-delete (`LUA_SAFE_RELEASE_LOCK`), guaranteeing a delayed or resumed runner can never delete a lock acquired by a subsequent runner.
+   - Persists a unique `ScheduleOccurrence` record keyed by `(schedule_id, scheduled_fire_time)` before job creation. If overlapping Beat runs or worker restarts attempt to process the same fire time, the duplicate attempt hits a database unique constraint violation and aborts cleanly without generating duplicate jobs.
+   - Malformed legacy schedules fail closed per-schedule (disabled and audited via `schedule.invalid_disabled`), leaving healthy schedules unaffected.
+
+### Why
+
+1. **Dual-Write Vulnerability Elimination**: In distributed systems, publishing to an external queue (Celery/Redis) *inside* an uncommitted database transaction risks dispatching work that is subsequently rolled back by the database, causing workers to process ghost jobs. Conversely, publishing *after* commit without a durable record risks losing the event if the process crashes before network dispatch. The Transactional Outbox guarantees at-least-once delivery with zero phantom tasks.
+2. **Elimination of Concurrent DAG Join Races**: When parent tasks complete simultaneously, checking `uncompleted_count == 0` in parallel without a serialization boundary previously caused multiple workers to concurrently evaluate the join as satisfied and duplicate-dispatch the child. The atomic conditional update provides a zero-overhead database-level mutex.
+3. **Elimination of Cron Drift & Stale Lock Deletion**: Standard Redis key-expiry locks suffer from clock drift and stale releases (worker A takes longer than TTL, worker B acquires lock, worker A finishes and deletes worker B's lock). An owned UUID token released via Lua compare-and-delete combined with database-enforced `(schedule_id, scheduled_fire_time)` uniqueness guarantees exactly-one job created per scheduled tick.
+
+---
+
 ## Decision summary
 
 | Area | Chosen approach | Main reason |
@@ -1636,6 +1671,7 @@ Pulse hardens outbound webhook security and administrative authorization boundar
 | Outbound webhooks & signatures | HMAC-SHA256 (`whsec_...`) + SSRF validation + `pulse.internal` + delivery auditing | Cryptographic authenticity, replay prevention, and control-plane isolation |
 | Webhook secret hardening & KMS | AES-128 KMS encryption at rest + dual-signing rotation grace + delivery redaction + Org-Admin RBAC | Prevents key compromise, zero-downtime rotation, and protects delivery payload confidentiality |
 | Centralized invitations | Shared domain service `create_organization_invite` | Guarantees identical audit event format and single-use token lifecycle |
+| Transactional outbox & race elimination | Durable `outbox_events` + row locking + atomic conditional update join resolution + occurrence uniqueness | Eliminates ghost dispatches, fan-in duplicate runs, and cron double ticks under concurrency |
 | CI/CD & multi-arch delivery | GitHub Actions + ephemeral services + Buildx QEMU | Automated verification across PostgreSQL 16 & Redis 7 with AMD64/ARM64 container images |
 | End-to-end browser testing | Playwright + isolated browser contexts + Next.js webServer | Real browser verification of auth cookies, queue controls, DAG graphs, and webhooks |
 

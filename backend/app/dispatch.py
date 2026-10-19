@@ -1,41 +1,63 @@
-"""Single place that knows how to hand a Job to Celery. Used both when a
-job is first created (routers/jobs.py) and when a previously-BLOCKED
-dependent job is released after its dependency completes (tasks.py) — one
-code path, so both cases get identical priority routing and ETA handling.
+"""Single place that knows how to hand a Job to the execution pipeline.
+
+Records a durable Transactional Outbox event in PostgreSQL before triggering Celery,
+guaranteeing state changes are committed first, preventing duplicate dispatch
+caused by internal races or network partitions.
 """
 
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
 from app.models import Job, JobStatus
-from app.priority import priority_to_celery_queue
 from app.timeutils import utcnow
 
+logger = logging.getLogger(__name__)
 
-def dispatch_job(job: Job) -> None:
-    # Imported lazily to avoid a circular import (tasks.py imports this
-    # module too, and celery_app/tasks are what actually run the job).
-    from app.events import publish_event
-    from app.logging_config import get_correlation_id
-    from app.tasks import execute_job
 
-    corr_id = get_correlation_id() or str(job.id)
-    task_headers = {"correlation_id": corr_id}
+def dispatch_job(job: Job, db: Optional[Session] = None) -> None:
+    """Dispatches a job by recording an OutboxEvent and publishing it.
 
-    celery_queue = priority_to_celery_queue(job.priority)
+    If a database session is provided, records in that session; otherwise uses SessionLocal.
+    Guarantees the outbox record is committed to PostgreSQL before attempting Celery publish.
+    """
+    from app.database import SessionLocal
+    from app.outbox import publish_pending_outbox_events, record_event_outbox, record_job_dispatch_outbox
+
     if job.run_at and job.run_at > utcnow():
         job.status = JobStatus.SCHEDULED
-        execute_job.apply_async(args=[job.id], eta=job.run_at, queue=celery_queue, headers=task_headers)
     else:
         job.status = JobStatus.QUEUED
-        execute_job.apply_async(args=[job.id], queue=celery_queue, headers=task_headers)
+
+    session = db or SessionLocal()
+    should_close = (db is None)
 
     try:
+        record_job_dispatch_outbox(session, job)
         if job.queue and job.queue.project:
-            publish_event(job.queue.project.org_id, "job.queued" if job.status == JobStatus.QUEUED else "job.scheduled", {
-                "job_id": job.id,
-                "queue_id": job.queue_id,
-                "name": job.name,
-                "status": job.status.value,
-                "priority": job.priority,
-            })
-    except Exception:
-        pass
+            record_event_outbox(
+                session,
+                job.queue.project.org_id,
+                "job.queued" if job.status == JobStatus.QUEUED else "job.scheduled",
+                {
+                    "job_id": job.id,
+                    "queue_id": job.queue_id,
+                    "name": job.name,
+                    "status": job.status.value,
+                    "priority": job.priority,
+                },
+            )
+        session.commit()
 
+        # Immediate outbox publication attempt for minimal latency
+        try:
+            publish_pending_outbox_events(session)
+        except Exception as exc:
+            logger.debug("Immediate outbox publish deferred to background worker: %s", exc)
+
+    finally:
+        if should_close:
+            session.close()

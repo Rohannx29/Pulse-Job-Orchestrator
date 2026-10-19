@@ -98,6 +98,28 @@ Organization ── owns ──> WebhookSubscription × N
 - **`WebhookSubscription`**: Scoped to an `organization_id`. Stores the destination `url`, KMS-encrypted signing `secret` (VARCHAR 512, `enc:v1:...`), optional `previous_secret` (VARCHAR 512, `enc:v1:...`) and `previous_secret_expires_at` (TIMESTAMP) for dual-signing rotation grace periods, subscribed `events` array (e.g. `["*"]` or `["job.completed", "job.failed"]`), `is_active` boolean, and optional description.
 - **`WebhookDelivery`**: Audit log of each outbound dispatch attempt linked to `subscription_id` with `event`, redacted request `payload`, HTTP `status_code`, sanitized `response_body` (capped at 2KB), sanitized `error_message`, execution `duration_ms`, `attempt_number`, and `is_success`. Cascades on subscription deletion.
 
+### Transactional outbox and schedule deduplication
+
+```text
+OutboxEvent (outbox_events)
+ ├── id (UUID PK)
+ ├── event_type & aggregate_type & aggregate_id
+ ├── payload (JSONB task execution arguments & headers)
+ ├── status (PENDING | DISPATCHED | FAILED)
+ ├── fencing_key (unique deterministic string)
+ ├── retry_count & last_error
+ └── published_at & created_at
+
+JobSchedule ── owns ──> ScheduleOccurrence × N (schedule_occurrences)
+                             ├── id (UUID PK)
+                             ├── scheduled_fire_time (DateTime)
+                             ├── dispatched_job_id (FK -> jobs.id, nullable)
+                             └── dispatched_at (DateTime)
+```
+
+- **`OutboxEvent`**: Records atomic state transitions causing external side effects (Celery job dispatch, real-time SSE broadcasts, and outbound webhooks). Dispatched post-commit and claimed via row-level locking (`SELECT ... FOR UPDATE SKIP LOCKED`).
+- **`ScheduleOccurrence`**: Persists unique fire ticks for cron schedules. Uniquely keyed by `(schedule_id, scheduled_fire_time)` to guarantee exactly-once job creation across concurrent Beat runs and worker crashes.
+
 ## Important constraints
 
 - `users.email` is unique.
@@ -117,6 +139,10 @@ Organization ── owns ──> WebhookSubscription × N
 - `(parent_job_id, child_job_id)` is the composite primary key in `job_dependencies`.
 - `job_dependencies.parent_job_id` and `job_dependencies.child_job_id` are foreign-keyed to `jobs.id` with `CASCADE`.
 - `job_dependencies.child_job_id` and `job_dependencies.parent_job_id` are individually indexed for fast prerequisite resolution and recursive cascading failure traversal.
+- `outbox_events.fencing_key` is unique and indexed.
+- `(status, created_at)` is indexed in `outbox_events` for locked claiming.
+- `(schedule_id, scheduled_fire_time)` is unique in `schedule_occurrences` (`uq_schedule_occurrence_fire_time`).
+- `schedule_occurrences.schedule_id` is foreign-keyed to `job_schedules.id` with `CASCADE`.
 
 ---
 

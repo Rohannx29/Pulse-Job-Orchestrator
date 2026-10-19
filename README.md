@@ -61,6 +61,7 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Production deployment hardening | ✅ | Multi-stage Docker builds, non-root users (`pulse:pulse`, `nextjs:nodejs`), `no-new-privileges`, healthchecks, restart policies |
 | Data retention & table pruning | ✅ | Automated Celery Beat batch pruning (`pulse.internal`) & admin trigger (`POST /admin/prune`) for heartbeats, logs, executions, and terminal jobs |
 | Outbound Webhooks & Secret Hardening | ✅ | Cryptographic HMAC-SHA256 (`whsec_...`), KMS encryption at rest (Fernet), dual-signing rotation grace window, automatic delivery redaction, SSRF protection, Celery delivery worker (`pulse.internal`), and strict Org-Admin RBAC boundary |
+| Transactional Outbox & Race-Free Dispatch | ✅ | Atomic PostgreSQL transactional outbox (`outbox_events`), row-level locked claiming (`SKIP LOCKED`), idempotent publisher with retry bounds, atomic conditional DAG fan-in unblocking, and unique `(schedule_id, scheduled_fire_time)` occurrence deduplication |
 | CI/CD & Multi-Arch Container Builds | ✅ | GitHub Actions workflow with PostgreSQL 16 & Redis 7 service containers, Ruff linting, coverage reporting, Next.js build verification, Docker Compose smoke tests, and Buildx multi-arch images (`linux/amd64`, `linux/arm64`) |
 | End-to-End Testing (Playwright) | ✅ | Automated browser test suite covering registration, auth lifecycle, project/queue management, multi-parent DAG workflow inspection, outbound webhooks, and audit logs |
 
@@ -100,6 +101,7 @@ pulse/
 │   │   ├── url_safety.py      # SSRF protections
 │   │   ├── audit.py           # immutable audit logging helper
 │   │   ├── events.py          # Redis Pub/Sub real-time event publisher
+│   │   ├── outbox.py          # Transactional outbox engine, atomic event persistence & locked publisher
 │   │   ├── webhooks.py        # Outbound webhook signing, SSRF validation & delivery engine
 │   │   ├── dag.py             # Multi-parent DAG engine, DFS cycle detection & join resolution
 │   │   ├── rate_limiter.py    # Redis sliding-window rate limiter
@@ -403,15 +405,10 @@ Therefore:
 
 The following are intentionally outside the current implementation scope:
 
-- Prometheus/OpenTelemetry metrics
-- production-grade secrets management
-- production Docker hardening and a dedicated production Compose/deployment configuration
-- multi-parent/fan-in job dependencies
-- long-running handler lease renewal
-- full dependency-aware readiness checks
-
-
-These are documented as future hardening rather than implied as complete features.
+- Dedicated egress proxy / network firewall for hardware-level DNS rebinding defense
+- Active lease heartbeat renewal for jobs exceeding 30-minute durations
+- Cloud KMS / HSM-backed hardware keystore (currently software Fernet AES-128 master key)
+- Distributed OpenTelemetry tracing collector export (currently structured single-line JSON logs with correlation IDs)
 
 ## Documentation
 

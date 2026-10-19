@@ -42,6 +42,7 @@ Important modules include:
 app/main.py
 app/routers/*.py
 app/dispatch.py
+app/outbox.py
 app/events.py
 app/rate_limiter.py
 app/auth_hardening.py
@@ -50,6 +51,10 @@ app/deps.py
 app/security.py
 app/audit.py
 app/logging_config.py
+app/dag.py
+app/webhooks.py
+app/kms.py
+app/redaction.py
 ```
 
 ### 3.3 PostgreSQL
@@ -210,29 +215,49 @@ Retry strategy is selected from the optional `RetryPolicy` attached to the Job. 
 
 This distinction is intentional in the documentation because it reflects the current implementation rather than the earlier planned model.
 
-## 8. Dependency execution
+## 8. Multi-Parent DAG Dependency execution
 
-The current model supports one dependency per Job:
+Pulse supports arbitrary Directed Acyclic Graph (DAG) workflows with multi-parent fan-in (`A, B → C`), multi-child fan-out (`C → D, E`), diamond joins (`A → B, C → D`), and recursive cascading DLQ failure propagation:
 
 ```text
-A → B → C
+       ┌───────────┐
+       │   Job A   │
+       └─────┬─────┘
+             │ (Fan-Out)
+       ┌─────┴─────┐
+       ▼           ▼
+  ┌─────────┐ ┌─────────┐
+  │  Job B  │ │  Job C  │
+  └────┬────┘ └────┬────┘
+       │ (Fan-In)  │
+       └─────┬─────┘
+             ▼
+       ┌───────────┐
+       │   Job D   │ (Atomic Join: Waits for BOTH B & C)
+       └───────────┘
 ```
 
-If B depends on A and A is incomplete, B is stored as `BLOCKED` and is not dispatched.
+1. **Cycle Prevention**: Real-time Depth-First Search (`detect_cycle_dfs`) strictly rejects cyclic submissions (direct, transitive, and self-loops) before persistence.
+2. **Atomic Fan-In Unblocking**: When multiple prerequisites finish simultaneously, the race is resolved atomically at the database boundary via a conditional status update:
+   ```sql
+   UPDATE jobs SET status = 'QUEUED' WHERE id = :id AND status = 'BLOCKED'
+   ```
+   Only the single winning thread where `rowcount == 1` records the dispatch event. Competing threads observe `rowcount == 0` and safely skip dispatch.
+3. **Cascading Failure**: If any prerequisite permanently fails into DLQ, all downstream blocked dependents recursively transition to `DEAD_LETTER` with complete upstream failure provenance in `DeadLetterJob`.
 
-When A completes, B is released through the normal dispatch path.
+## 9. Scheduling & Deduplication
 
-If A reaches the dead-letter state, dependents are recursively propagated to dead-letter state so a dependency chain does not remain permanently blocked.
+A `JobSchedule` contains a standard five-field cron expression (validated on write via `croniter.is_valid`) and a payload template.
 
-The current API does not support fan-in such as `C waits for A AND B`.
+Beat periodically evaluates active schedules. When a schedule is due, Pulse guarantees exactly-once dispatch per scheduled tick:
 
-## 9. Scheduling
-
-A `JobSchedule` contains a standard five-field cron expression and a payload template.
-
-Beat periodically evaluates active schedules. When a schedule is due, it creates an ordinary Job and routes that Job through the same priority/retry/execution machinery used for ad-hoc jobs.
-
-A short Redis mutex prevents overlapping cron-dispatch runs from both processing the same due schedule at the same time. The lock is a best-effort overlap guard; it is not a distributed exactly-once scheduling protocol.
+1. **Owned Redis Mutex**: A distributed lock using a unique random UUID token and atomic Lua compare-and-delete prevents concurrent Beat instances from executing simultaneously without risk of stale runner deletions.
+2. **Occurrence Deduplication**: Before creating any job, a `ScheduleOccurrence` record is persisted with a database unique constraint:
+   ```sql
+   UNIQUE(schedule_id, scheduled_fire_time)
+   ```
+   If overlapping Beat ticks or worker crashes attempt to process the same fire time, the duplicate runner hits an integrity violation, rolls back cleanly, and skips dispatch.
+3. **Fail-Closed Malformed Cron Protection**: If legacy data contains invalid cron expressions, the orchestrator fails closed per-schedule (disabling the offending schedule and recording a `schedule.invalid_disabled` audit event) while healthy schedules continue processing uninterrupted.
 
 ## 10. Authentication and tenant isolation
 
@@ -267,6 +292,15 @@ Therefore:
 - submission idempotency is handled by the `(queue_id, idempotency_key)` constraint;
 - exactly-once external side effects are not guaranteed by Pulse;
 - handlers interacting with external systems must use their own idempotency strategy where necessary.
+
+### 11.1 Transactional Outbox & Internal Race Elimination
+
+To eliminate dual-write vulnerabilities and internal duplicate dispatch caused by races:
+
+1. **Transactional Outbox Table (`outbox_events`)**: All state transitions that cause Celery work, real-time SSE broadcasts, or outbound webhooks write an immutable `OutboxEvent` in the *exact same* PostgreSQL transaction as the primary application state.
+2. **Post-Commit Publication**: Publication to Celery queues or Redis Pub/Sub occurs only after the database transaction successfully commits. If the request transaction aborts or rolls back, no external work is published.
+3. **Idempotent Background Publisher with Row Locking**: If immediate post-commit publication fails or the API process crashes, Celery Beat runs `process_outbox_events`. Workers safely claim pending outbox batches using PostgreSQL `SELECT ... FOR UPDATE SKIP LOCKED` (or atomic state updates), preventing concurrent workers from claiming or double-dispatching rows.
+4. **Fencing Keys & Bounded Retries**: Outbox rows carry unique fencing keys (e.g. `job:dispatch:<job_id>:<retry_count>`). If external delivery encounters transient broker errors, the publisher increments `retry_count` and records `last_error`. After reaching `MAX_OUTBOX_RETRIES` (5), the event transitions to `FAILED` for operator investigation.
 
 ## 12. Architecture boundaries
 

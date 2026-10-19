@@ -66,6 +66,12 @@ class LogLevel(str, enum.Enum):
     ERROR = "error"
 
 
+class OutboxStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    DISPATCHED = "DISPATCHED"
+    FAILED = "FAILED"
+
+
 # ---------- Core entities ----------
 
 class User(Base):
@@ -220,6 +226,7 @@ class JobSchedule(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     queue = relationship("Queue", back_populates="schedules")
+    occurrences = relationship("ScheduleOccurrence", back_populates="schedule", cascade="all, delete-orphan")
 
 
 class Job(Base):
@@ -425,5 +432,48 @@ class WebhookDelivery(Base):
     delivered_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
     subscription = relationship("WebhookSubscription", back_populates="deliveries")
+
+
+class ScheduleOccurrence(Base):
+    """Tracks uniquely executed occurrences of recurring cron schedules.
+    Prevents duplicate fire events across overlapping Beat ticks or worker crashes."""
+
+    __tablename__ = "schedule_occurrences"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    schedule_id = Column(UUID(as_uuid=False), ForeignKey("job_schedules.id", ondelete="CASCADE"), nullable=False, index=True)
+    scheduled_fire_time = Column(DateTime, nullable=False, index=True)
+    dispatched_job_id = Column(UUID(as_uuid=False), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    dispatched_at = Column(DateTime, default=utcnow, nullable=False)
+
+    schedule = relationship("JobSchedule", back_populates="occurrences")
+
+    __table_args__ = (
+        UniqueConstraint("schedule_id", "scheduled_fire_time", name="uq_schedule_occurrence_fire_time"),
+    )
+
+
+class OutboxEvent(Base):
+    """Transactional Outbox for atomic, durable state transitions.
+    Guarantees state changes causing Celery work, SSE, or webhooks are recorded
+    in the same DB transaction and only published after commit."""
+
+    __tablename__ = "outbox_events"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    event_type = Column(String(100), nullable=False, index=True)
+    aggregate_type = Column(String(50), nullable=False, index=True)
+    aggregate_id = Column(String(255), nullable=False, index=True)
+    payload = Column(JSONB, nullable=False, default=dict)
+    status = Column(Enum(OutboxStatus, name="outbox_status_enum", native_enum=False), nullable=False, default=OutboxStatus.PENDING, index=True)
+    fencing_key = Column(String(255), nullable=True, unique=True, index=True)
+    retry_count = Column(Integer, default=0, nullable=False)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+    published_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_outbox_events_status_created", "status", "created_at"),
+    )
 
 

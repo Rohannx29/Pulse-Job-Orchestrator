@@ -214,25 +214,41 @@ def release_dag_dependents(db: Session, completed_job: Job, dispatcher=None) -> 
         )
 
         if uncompleted_count == 0:
-            # All prerequisites fulfilled -> unblock child!
-            child.status = JobStatus.QUEUED
-            run_dispatch = dispatcher if dispatcher is not None else dispatch_job
-            run_dispatch(child)
-            unblocked_jobs.append(child)
-
-            dep_org_id = get_job_org_id(db, child)
-            if dep_org_id:
-                publish_event(dep_org_id, "job.queued", {
-                    "job_id": child.id,
-                    "queue_id": child.queue_id,
-                    "status": JobStatus.QUEUED.value,
-                    "unblocked_by": completed_job.id,
-                })
-            logger.info(
-                "All %d prerequisites completed. Unblocked dependent job %s",
-                len(required_parent_ids),
-                child.id,
+            # Atomic conditional update: transition BLOCKED -> QUEUED.
+            # Only the single winning thread where rowcount == 1 creates the dispatch event.
+            updated_count = (
+                db.query(Job)
+                .filter(
+                    Job.id == child.id,
+                    Job.status == JobStatus.BLOCKED,
+                )
+                .update({Job.status: JobStatus.QUEUED}, synchronize_session="fetch")
             )
+
+            if updated_count == 1:
+                # Winner! Dispatch child job
+                run_dispatch = dispatcher if dispatcher is not None else dispatch_job
+                run_dispatch(child)
+                unblocked_jobs.append(child)
+
+                dep_org_id = get_job_org_id(db, child)
+                if dep_org_id:
+                    publish_event(dep_org_id, "job.queued", {
+                        "job_id": child.id,
+                        "queue_id": child.queue_id,
+                        "status": JobStatus.QUEUED.value,
+                        "unblocked_by": completed_job.id,
+                    })
+                logger.info(
+                    "All %d prerequisites completed. Unblocked dependent job %s (atomic winner)",
+                    len(required_parent_ids),
+                    child.id,
+                )
+            else:
+                logger.debug(
+                    "Child job %s already unblocked by a concurrent prerequisite completion (lost race)",
+                    child.id,
+                )
         else:
             logger.debug(
                 "Child job %s waiting on %d remaining prerequisites",
