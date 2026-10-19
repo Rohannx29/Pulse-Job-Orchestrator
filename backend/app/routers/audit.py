@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.deps import get_current_user, get_user_org
@@ -31,18 +31,23 @@ def list_audit_logs(
     if resource_type:
         query = query.filter(AuditLog.resource_type == resource_type)
 
-    logs = query.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
+    logs = (
+        query.options(joinedload(AuditLog.user))
+        .order_by(AuditLog.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
 
     result = []
     for log in logs:
-        actor = db.get(User, log.user_id) if log.user_id else None
         result.append(
             AuditLogOut(
                 id=log.id,
                 org_id=log.org_id,
                 user_id=log.user_id,
-                user_email=actor.email if actor else None,
-                user_name=actor.full_name if actor else None,
+                user_email=log.user.email if log.user else None,
+                user_name=log.user.full_name if log.user else None,
                 action=log.action,
                 resource_type=log.resource_type,
                 resource_id=log.resource_id,

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -39,19 +40,21 @@ def list_all_organizations(
 ):
     """List all organizations across the entire platform."""
     orgs = db.query(Organization).order_by(Organization.created_at.desc()).all()
-    result = []
-    for org in orgs:
-        count = db.query(OrganizationMember).filter(OrganizationMember.org_id == org.id).count()
-        result.append(
-            AdminOrgOut(
-                id=org.id,
-                name=org.name,
-                owner_id=org.owner_id,
-                member_count=count,
-                created_at=org.created_at,
-            )
+    member_counts = dict(
+        db.query(OrganizationMember.org_id, func.count(OrganizationMember.id))
+        .group_by(OrganizationMember.org_id)
+        .all()
+    )
+    return [
+        AdminOrgOut(
+            id=org.id,
+            name=org.name,
+            owner_id=org.owner_id,
+            member_count=member_counts.get(org.id, 0),
+            created_at=org.created_at,
         )
-    return result
+        for org in orgs
+    ]
 
 
 @router.get("/users", response_model=list[AdminUserOut])

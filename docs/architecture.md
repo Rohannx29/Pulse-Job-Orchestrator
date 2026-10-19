@@ -468,6 +468,15 @@ Metrics & Audit Trail:
 - **Concurrency Locking**: Periodic Beat dispatch is guarded by a Redis mutex lock (`pulse:lock:prune_stale_data`). If a large prune takes longer than expected, overlapping executions are safely skipped.
 - **Compliance Auditability**: System-level prune operations are permanently recorded in PostgreSQL audit logs, documenting exact deleted row counts across tables, execution duration in milliseconds, and the actor (automated Beat or system admin).
 
+## 19. Database query efficiency and connection pooling
 
+High-throughput distributed systems require predictable database latency under heavy concurrent request and worker volume:
 
+### 19.1 N+1 query elimination
+- **Job Details & Execution Logs**: The `/jobs/{job_id}` endpoint utilizes SQLAlchemy `selectinload(Job.executions).selectinload(JobExecution.logs)` combined with `joinedload(Job.queue).joinedload(Queue.project)`. This consolidates nested parent-child-grandchild relationships and organization boundary authorization into single optimized queries, completely eliminating N+1 round-trips.
+- **Organization Members**: The `/orgs/me/members` endpoint uses `joinedload(OrganizationMember.user)` to fetch member records and associated user profile details in a single SQL join rather than querying individual users iteratively.
+- **Platform-Wide Aggregation**: The `/admin/organizations` endpoint computes organization member counts using a single grouped query (`SELECT org_id, count(id) FROM organization_members GROUP BY org_id`) mapped via in-memory dictionary lookup, avoiding per-organization count queries.
 
+### 19.2 Connection pool hygiene
+- **Pre-Ping & Recycling**: Database engines are configured with `pool_pre_ping=True` and connection recycling (`pool_recycle=1800`) to detect and discard stale or severed TCP sockets before handing connections to request handlers.
+- **Fail-Open Resilience**: Operational dependencies (Redis rate limiters, pub/sub event emitters, and concurrency semaphores) are isolated within fail-open try/except blocks to guarantee that transient caching or message broker blips never cascade into API 500 downtime.

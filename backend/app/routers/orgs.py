@@ -1,6 +1,6 @@
 from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.deps import get_current_user, get_user_org, require_org_admin
@@ -38,20 +38,20 @@ def list_org_members(db: Session = Depends(get_db), user: User = Depends(get_cur
     org = get_user_org(db, user)
     members = (
         db.query(OrganizationMember)
+        .options(joinedload(OrganizationMember.user))
         .filter(OrganizationMember.org_id == org.id)
         .order_by(OrganizationMember.created_at.asc())
         .all()
     )
     result = []
     for m in members:
-        u = db.get(User, m.user_id)
-        if u:
+        if m.user:
             result.append(
                 OrgMemberOut(
                     id=m.id,
-                    user_id=u.id,
-                    email=u.email,
-                    full_name=u.full_name,
+                    user_id=m.user.id,
+                    email=m.user.email,
+                    full_name=m.user.full_name,
                     role=m.role,
                     created_at=m.created_at,
                 )

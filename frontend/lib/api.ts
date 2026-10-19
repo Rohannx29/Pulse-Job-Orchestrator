@@ -275,7 +275,19 @@ export interface SystemHealth {
 }
 
 export async function getSystemHealth(): Promise<SystemHealth> {
-  const res = await fetch(`${API_URL}/health`);
-  return res.json();
+  try {
+    const res = await fetch(`${API_URL}/health`);
+    return await res.json();
+  } catch {
+    return {
+      status: "unhealthy",
+      timestamp: new Date().toISOString(),
+      version: "0.1.0",
+      components: {
+        database: { status: "unhealthy", latency_ms: 0, error: "API unreachable" },
+        redis: { status: "unhealthy", latency_ms: 0, error: "API unreachable" },
+      },
+    };
+  }
 }
 

@@ -15,6 +15,10 @@ if HAS_CELERY:
         include=["app.tasks"],
     )
 else:
+    class _DummyControl:
+        def inspect(self, *args, **kwargs):
+            return type("Inspect", (), {"stats": lambda self: {}, "active": lambda self: {}})()
+
     class _DummyCelery:
         class _Conf:
             def __init__(self):
@@ -23,6 +27,7 @@ else:
                 pass
         def __init__(self):
             self.conf = self._Conf()
+            self.control = _DummyControl()
         def task(self, *args, **kwargs):
             def decorator(fn):
                 fn.apply_async = lambda *a, **k: None

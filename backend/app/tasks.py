@@ -400,7 +400,10 @@ def sync_worker_heartbeats():
 
         # Mark workers that didn't respond this cycle as offline if stale
         stale_cutoff = utcnow() - timedelta(seconds=60)
-        for worker in db.query(Worker).filter(Worker.hostname.notin_(seen_hostnames)).all():
+        stale_query = db.query(Worker)
+        if seen_hostnames:
+            stale_query = stale_query.filter(Worker.hostname.notin_(seen_hostnames))
+        for worker in stale_query.all():
             if worker.last_heartbeat_at and worker.last_heartbeat_at < stale_cutoff:
                 worker.status = WorkerStatus.OFFLINE
 

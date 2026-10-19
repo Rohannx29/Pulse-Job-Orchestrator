@@ -2,12 +2,12 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.database import get_db
 from app.deps import get_current_user, user_can_access_org
 from app.dispatch import dispatch_job
-from app.models import Job, JobStatus, Organization, Project, Queue, User
+from app.models import Job, JobExecution, JobStatus, Organization, Project, Queue, User
 from app.schemas import JobBatchCreate, JobCreate, JobDetailOut, JobOut
 
 router = APIRouter(tags=["jobs"])
@@ -200,12 +200,15 @@ def list_jobs(
 def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     job = (
         db.query(Job)
-        .options(joinedload(Job.executions))
+        .options(
+            selectinload(Job.executions).selectinload(JobExecution.logs),
+            joinedload(Job.queue).joinedload(Queue.project),
+        )
         .filter(Job.id == job_id)
         .first()
     )
-    # ownership re-check (joinedload query above doesn't filter by org)
-    _get_owned_job(db, job_id, user)
+    if not job or not user_can_access_org(db, user, job.queue.project.org_id):
+        raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 

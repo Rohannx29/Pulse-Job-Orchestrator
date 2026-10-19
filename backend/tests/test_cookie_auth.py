@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from app.database import get_db
 from app.main import app
-from app.models import User
+from app.models import User, UserRole
 from app.security import hash_password
 
 
@@ -30,6 +30,7 @@ def client():
         email="user@example.com",
         full_name="Test User",
         hashed_password=hash_password("correct-horse-battery-staple"),
+        role=UserRole.ORG_ADMIN,
     )
     db = Mock()
     db.query.return_value.filter.return_value.first.return_value = user

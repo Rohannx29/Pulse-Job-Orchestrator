@@ -34,7 +34,7 @@ class UserOut(BaseModel):
     id: str
     email: EmailStr
     full_name: Optional[str] = None
-    role: UserRole
+    role: UserRole = UserRole.ORG_ADMIN
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -71,10 +71,13 @@ def acquire_queue_slot(queue_id: str, limit: int, ttl_seconds: int = LEASE_TTL_S
     release_queue_slot — this is what makes releases ownership-aware."""
     token = uuid.uuid4().hex
     now = time.time()
-    acquired = _acquire_script(
-        keys=[_key(queue_id)], args=[limit, token, now, now + ttl_seconds]
-    )
-    return token if acquired else None
+    try:
+        acquired = _acquire_script(
+            keys=[_key(queue_id)], args=[limit, token, now, now + ttl_seconds]
+        )
+        return token if acquired else None
+    except Exception:
+        return None
 
 
 def release_queue_slot(queue_id: str, token: str) -> None:
@@ -82,11 +85,17 @@ def release_queue_slot(queue_id: str, token: str) -> None:
     released) rather than erroring — releasing twice, or releasing late
     after a lease already expired, should never be able to affect anyone
     else's slot."""
-    _redis.zrem(_key(queue_id), token)
+    try:
+        _redis.zrem(_key(queue_id), token)
+    except Exception:
+        pass
 
 
 def current_usage(queue_id: str) -> int:
-    now = time.time()
-    key = _key(queue_id)
-    _redis.zremrangebyscore(key, "-inf", now)
-    return _redis.zcard(key)
+    try:
+        now = time.time()
+        key = _key(queue_id)
+        _redis.zremrangebyscore(key, "-inf", now)
+        return int(_redis.zcard(key) or 0)
+    except Exception:
+        return 0
