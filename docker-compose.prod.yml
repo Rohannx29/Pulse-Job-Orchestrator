@@ -1,0 +1,362 @@
+networks:
+  pulse-ingress:
+    name: pulse-ingress
+    driver: bridge
+  pulse-internal:
+    name: pulse-internal
+    driver: bridge
+    internal: true
+
+volumes:
+  pulse_pgdata:
+    name: pulse_pgdata
+  pulse_redisdata:
+    name: pulse_redisdata
+  pulse_backups:
+    name: pulse_backups
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Database (PostgreSQL 16) - Private network only, no public port mapping
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - pulse-internal
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+    volumes:
+      - pulse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+
+  # ---------------------------------------------------------------------------
+  # 2. Redis 7 - Private network only, password protected, no public port mapping
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: >
+      sh -c "redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --save 60 1 --loglevel notice"
+    networks:
+      - pulse-internal
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    volumes:
+      - pulse_redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  # ---------------------------------------------------------------------------
+  # 3. One-off Database Migration Runner (Alembic)
+  # ---------------------------------------------------------------------------
+  migration:
+    build:
+      context: ./backend
+      target: runtime
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - pulse-internal
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      IS_DEV: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # 4. Pulse API Service - Bound to local ingress/reverse-proxy only
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    networks:
+      - pulse-internal
+      - pulse-ingress
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:?WEBHOOK_ENCRYPTION_KEY must be set}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS must be set}
+      COOKIE_SECURE: "true"
+      COOKIE_SAMESITE: "lax"
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      METRICS_PROTECT: "true"
+      METRICS_TOKEN: ${METRICS_TOKEN:?METRICS_TOKEN must be set}
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "INFO"
+      IS_DEV: "false"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health/live || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+
+  # ---------------------------------------------------------------------------
+  # 5. Celery Worker Pools - Dedicated queues for complete workload isolation
+  # ---------------------------------------------------------------------------
+  worker-internal:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["celery", "-A", "app.celery_app", "worker", "-Q", "pulse.internal", "--loglevel=info", "--concurrency=2", "--hostname=worker-internal@%h"]
+    networks:
+      - pulse-internal
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:?WEBHOOK_ENCRYPTION_KEY must be set}
+      IS_DEV: "false"
+      LOG_FORMAT: "json"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  worker-high:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["celery", "-A", "app.celery_app", "worker", "-Q", "pulse.high", "--loglevel=info", "--concurrency=4", "--hostname=worker-high@%h"]
+    networks:
+      - pulse-internal
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:?WEBHOOK_ENCRYPTION_KEY must be set}
+      IS_DEV: "false"
+      LOG_FORMAT: "json"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+
+  worker-normal:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["celery", "-A", "app.celery_app", "worker", "-Q", "pulse.normal", "--loglevel=info", "--concurrency=4", "--hostname=worker-normal@%h"]
+    networks:
+      - pulse-internal
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:?WEBHOOK_ENCRYPTION_KEY must be set}
+      IS_DEV: "false"
+      LOG_FORMAT: "json"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+
+  worker-low:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["celery", "-A", "app.celery_app", "worker", "-Q", "pulse.low", "--loglevel=info", "--concurrency=2", "--hostname=worker-low@%h"]
+    networks:
+      - pulse-internal
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:?WEBHOOK_ENCRYPTION_KEY must be set}
+      IS_DEV: "false"
+      LOG_FORMAT: "json"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  # ---------------------------------------------------------------------------
+  # 6. Celery Beat Scheduler (Periodic Tasks & Housekeeping)
+  # ---------------------------------------------------------------------------
+  beat:
+    build:
+      context: ./backend
+      target: runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]
+    networks:
+      - pulse-internal
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      IS_DEV: "false"
+      LOG_FORMAT: "json"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # 7. Frontend (Next.js Dashboard Standalone) - Bound to local ingress only
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      target: runner
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - pulse-ingress
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL must be set}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  # ---------------------------------------------------------------------------
+  # 8. Automated Database Backup Service (Daily pg_dump with 14-day retention)
+  # ---------------------------------------------------------------------------
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - pulse-internal
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+    volumes:
+      - pulse_backups:/backups
+    command: >
+      sh -c '
+        while true; do
+          DATE=$$(date +%Y%m%d_%H%M%S)
+          echo "[Backup] Creating backup pulse_backup_$${DATE}.sql.gz..."
+          PGPASSWORD="$$POSTGRES_PASSWORD" pg_dump -h postgres -U "$$POSTGRES_USER" "$$POSTGRES_DB" | gzip > "/backups/pulse_backup_$${DATE}.sql.gz"
+          echo "[Backup] Backup complete. Purging backups older than 14 days..."
+          find /backups -name "pulse_backup_*.sql.gz" -mtime +14 -delete
+          sleep 86400
+        done
+      '
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M

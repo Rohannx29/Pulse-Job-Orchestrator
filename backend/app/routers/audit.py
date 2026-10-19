@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -11,10 +11,12 @@ router = APIRouter(prefix="/audit-logs", tags=["audit-logs"])
 
 @router.get("", response_model=list[AuditLogOut])
 def list_audit_logs(
+    response: Response,
     action: str | None = Query(default=None),
     resource_type: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, description="Cursor for timestamp-based keyset pagination"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -30,14 +32,35 @@ def list_audit_logs(
         query = query.filter(AuditLog.action == action)
     if resource_type:
         query = query.filter(AuditLog.resource_type == resource_type)
+    if cursor:
+        try:
+            from datetime import datetime
+            cursor_dt = datetime.fromisoformat(cursor)
+            query = query.filter(AuditLog.created_at < cursor_dt)
+        except ValueError:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Invalid cursor format; ISO 8601 datetime expected")
 
+    fetch_limit = min(limit, 100)
     logs = (
         query.options(joinedload(AuditLog.user))
         .order_by(AuditLog.created_at.desc())
         .offset(skip)
-        .limit(limit)
+        .limit(fetch_limit + 1)
         .all()
     )
+
+    if len(logs) > fetch_limit:
+        has_more = True
+        logs = logs[:fetch_limit]
+        next_cursor = logs[-1].created_at.isoformat()
+    else:
+        has_more = False
+        next_cursor = None
+
+    response.headers["X-Has-More"] = "true" if has_more else "false"
+    if next_cursor:
+        response.headers["X-Next-Cursor"] = next_cursor
 
     result = []
     for log in logs:

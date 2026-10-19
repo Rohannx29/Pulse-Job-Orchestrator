@@ -140,9 +140,15 @@ JobSchedule ── owns ──> ScheduleOccurrence × N (schedule_occurrences)
 - `job_dependencies.parent_job_id` and `job_dependencies.child_job_id` are foreign-keyed to `jobs.id` with `CASCADE`.
 - `job_dependencies.child_job_id` and `job_dependencies.parent_job_id` are individually indexed for fast prerequisite resolution and recursive cascading failure traversal.
 - `outbox_events.fencing_key` is unique and indexed.
-- `(status, created_at)` is indexed in `outbox_events` for locked claiming.
 - `(schedule_id, scheduled_fire_time)` is unique in `schedule_occurrences` (`uq_schedule_occurrence_fire_time`).
 - `schedule_occurrences.schedule_id` is foreign-keyed to `job_schedules.id` with `CASCADE`.
+- Named foreign keys: `jobs.depends_on_job_id` uses explicit constraint name `fk_jobs_depends_on_job_id` for deterministic migration downgrade and multi-dialect compatibility.
+- Keyset pagination compound indexes:
+  - `(queue_id, created_at DESC)` on `jobs` (`ix_jobs_queue_created`)
+  - `(status, created_at DESC)` on `jobs` (`ix_jobs_status_created`)
+  - `(org_id, created_at DESC)` on `audit_logs` (`ix_audit_logs_org_created`)
+  - `(subscription_id, delivered_at DESC)` on `webhook_deliveries` (`ix_webhook_deliveries_sub_delivered`)
+- Multi-tenant retry policy isolation: `jobs.retry_policy_id` must match `retry_policies.queue_id == jobs.queue_id` on submission.
 
 ---
 

@@ -63,7 +63,9 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Outbound Webhooks & Secret Hardening | ✅ | Cryptographic HMAC-SHA256 (`whsec_...`), KMS encryption at rest (Fernet), dual-signing rotation grace window, automatic delivery redaction, SSRF protection, Celery delivery worker (`pulse.internal`), and strict Org-Admin RBAC boundary |
 | Transactional Outbox & Race-Free Dispatch | ✅ | Atomic PostgreSQL transactional outbox (`outbox_events`), row-level locked claiming (`SKIP LOCKED`), idempotent publisher with retry bounds, atomic conditional DAG fan-in unblocking, and unique `(schedule_id, scheduled_fire_time)` occurrence deduplication |
 | Network & Session Security | ✅ | Query-string JWT completely removed in favor of httpOnly cookies, short-lived single-use SSE connection tickets (`POST /auth/sse-ticket`), trusted proxy IP validation (`X-Forwarded-For`), fail-closed auth rate limiting on Redis outage, defense-in-depth SSRF client (custom resolver, IP validation, redirects forbidden, 1MB payload caps), CSRF protection middleware, and private `/metrics` authorization |
-| CI/CD & Multi-Arch Container Builds | ✅ | GitHub Actions workflow with PostgreSQL 16 & Redis 7 service containers, Ruff linting, coverage reporting, Next.js build verification, Docker Compose smoke tests, and Buildx multi-arch images (`linux/amd64`, `linux/arm64`) |
+| Data Integrity & Keyset Pagination | ✅ | Strict cross-tenant `retry_policy_id` isolation, 256 KB JSON payload bounds, HTTP job URL/header/body limits, batch limits (100 jobs/batch), entity name length caps, timestamp keyset cursor pagination (`X-Has-More`, `X-Next-Cursor`), and compound indexes (`ix_jobs_queue_created`, `ix_jobs_status_created`, `ix_audit_logs_org_created`, `ix_webhook_deliveries_sub_delivered`) |
+| Production Topology & Automated Backups | ✅ | Production compose topology (`docker-compose.prod.yml`) with zero published internal ports for Postgres/Redis, Redis password auth (`requirepass`), one-off migration gate (`migration`), dedicated Celery pools, non-root users (`10001:10001`, `1001:1001`), resource caps, network segmentation, and automated daily database backup service with 14-day retention |
+| CI/CD & Security Audits | ✅ | GitHub Actions workflow with PostgreSQL 16 & Redis 7 service containers, migration round-trip tests (`upgrade -> downgrade -> upgrade`), Ruff linting, pip-audit, npm audit, Gitleaks secret scanning, Trivy image vulnerability & CycloneDX SBOM generation, Docker Compose validation, and multi-arch container delivery (`linux/amd64`, `linux/arm64`) |
 | End-to-End Testing (Playwright) | ✅ | Automated browser test suite covering registration, auth lifecycle, project/queue management, multi-parent DAG workflow inspection, outbound webhooks, and audit logs |
 
 
@@ -72,11 +74,13 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 ```text
 pulse/
 ├── README.md
-├── docker-compose.yml
+├── docker-compose.yml         # Local development compose configuration
+├── docker-compose.prod.yml    # Hardened production compose configuration (segmented networks, resource caps, backups)
+├── .env.production.example    # Production environment template & secret generation instructions
 ├── .github/
 │   ├── dependabot.yml         # Automated dependency vulnerability scanning
 │   └── workflows/
-│       └── ci.yml             # Automated testing, linting, Next.js build & multi-arch container delivery
+│       └── ci.yml             # Automated testing, linting, migration round-trips, security scans & multi-arch delivery
 │
 ├── backend/
 │   ├── Dockerfile
@@ -354,7 +358,7 @@ celery -A app.celery_app beat --loglevel=info
 
 ## Testing
 
-The backend test suite contains **99 test cases across 20 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, transactional outbox race prevention, schedule deduplication, cookie authentication, network security, SSRF defense in depth, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, and retention pruning. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
+The backend test suite contains **111 test cases across 22 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, transactional outbox race prevention, schedule deduplication, cookie authentication, network security, SSRF defense in depth, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, data integrity bounds, cross-tenant retry policy isolation, cursor pagination, and Alembic migration round-trips. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
 
 Run backend tests:
 
@@ -366,6 +370,8 @@ python -m pytest tests/ -v
 Targeted test suites:
 
 ```bash
+python -m pytest tests/test_data_integrity.py -v
+python -m pytest tests/test_migrations.py -v
 python -m pytest tests/test_network_security.py -v
 python -m pytest tests/test_outbox_concurrency.py -v
 python -m pytest tests/test_webhook_rbac.py -v

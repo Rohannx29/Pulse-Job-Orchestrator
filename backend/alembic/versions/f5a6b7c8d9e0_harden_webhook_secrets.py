@@ -19,33 +19,24 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Expand secret column length to accommodate KMS Fernet ciphertext tokens
-    op.alter_column(
-        'webhook_subscriptions',
-        'secret',
-        existing_type=sa.String(length=255),
-        type_=sa.String(length=512),
-        existing_nullable=False,
-    )
-
-    # 2. Add previous_secret and expiration for rotation grace window
-    op.add_column(
-        'webhook_subscriptions',
-        sa.Column('previous_secret', sa.String(length=512), nullable=True),
-    )
-    op.add_column(
-        'webhook_subscriptions',
-        sa.Column('previous_secret_expires_at', sa.DateTime(), nullable=True),
-    )
+    with op.batch_alter_table('webhook_subscriptions') as batch_op:
+        batch_op.alter_column(
+            'secret',
+            existing_type=sa.String(length=255),
+            type_=sa.String(length=512),
+            existing_nullable=False,
+        )
+        batch_op.add_column(sa.Column('previous_secret', sa.String(length=512), nullable=True))
+        batch_op.add_column(sa.Column('previous_secret_expires_at', sa.DateTime(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column('webhook_subscriptions', 'previous_secret_expires_at')
-    op.drop_column('webhook_subscriptions', 'previous_secret')
-    op.alter_column(
-        'webhook_subscriptions',
-        'secret',
-        existing_type=sa.String(length=512),
-        type_=sa.String(length=255),
-        existing_nullable=False,
-    )
+    with op.batch_alter_table('webhook_subscriptions') as batch_op:
+        batch_op.drop_column('previous_secret_expires_at')
+        batch_op.drop_column('previous_secret')
+        batch_op.alter_column(
+            'secret',
+            existing_type=sa.String(length=512),
+            type_=sa.String(length=255),
+            existing_nullable=False,
+        )

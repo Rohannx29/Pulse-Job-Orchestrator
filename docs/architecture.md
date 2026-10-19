@@ -776,4 +776,56 @@ Pulse replaces naive pre-flight DNS lookups with an integrated, defense-in-depth
 ### 24.5 Private monitoring infrastructure & /metrics protection
 - The Prometheus telemetry endpoint (`GET /metrics`) is isolated from public exposition. Production deployments can enable `METRICS_PROTECT=true` to restrict scraping strictly to internal cluster CIDRs and require Bearer token authorization via `METRICS_TOKEN`.
 
+---
+
+## 25. Data Integrity, Migration Reliability, and Production Deployment Topology
+
+### 25.1 Multi-tenant queue isolation & retry policy ownership verification
+To prevent cross-tenant resource contamination, the job creation endpoints (`POST /projects/{project_id}/queues/{queue_id}/jobs` and `.../jobs/batch`) verify that any referenced `retry_policy_id` belongs strictly to the target `queue_id`. If an authenticated user attempts to associate a retry policy belonging to another queue or organization, the API aborts with `HTTP 400 Bad Request` ("Retry policy not found or does not belong to this queue"), ensuring zero cross-tenant policy leakage.
+
+### 25.2 Strict request bounds, payload caps & keyset cursor pagination
+- **Payload & Field Bounds**:
+  - `JobCreate.payload`: capped at **256 KB** serialized JSON (`MAX_JOB_PAYLOAD_BYTES = 262_144`).
+  - HTTP Job Handlers: URL capped at 2,048 characters; HTTP headers capped at 50 key-value pairs (max 128 chars key / 2,048 chars value); body capped at 256 KB.
+  - Batch Submissions: `JobBatchCreate.jobs` capped at a maximum of 100 jobs per batch request.
+  - Entity Names: Project, Queue, Schedule, and Webhook Subscription names are bounded to 120 characters with strict non-empty constraints.
+- **Keyset Cursor Pagination**:
+  To protect database performance on high-volume endpoints (`GET /projects/{project_id}/queues/{queue_id}/jobs` and `GET /audit-logs`), Pulse implements keyset cursor pagination based on `created_at` timestamps:
+  - Clients pass `?cursor=<ISO-8601-timestamp>&limit=<1..100>`.
+  - The API queries `limit + 1` rows to detect whether additional pages exist without executing expensive `COUNT(*)` table scans.
+  - Response headers include `X-Has-More: true|false` and `X-Next-Cursor: <timestamp>`.
+  - CORS configurations explicitly expose `X-Has-More` and `X-Next-Cursor` to dashboard clients.
+- **Compound Performance Indexes**:
+  - `Job`: `ix_jobs_queue_created (queue_id, created_at DESC)` and `ix_jobs_status_created (status, created_at DESC)`.
+  - `AuditLog`: `ix_audit_logs_org_created (org_id, created_at DESC)`.
+  - `WebhookDelivery`: `ix_webhook_deliveries_sub_delivered (subscription_id, delivered_at DESC)`.
+
+### 25.3 Alembic migration robustness & named foreign keys
+All database migrations are verified for bi-directional round-trip execution:
+- Foreign keys in migrations are explicitly named (`fk_jobs_depends_on_job_id`) in both `create_foreign_key` and `drop_constraint` calls, preventing downgrade failures across PostgreSQL and SQLite batch engines.
+- Postgres-specific DDL operations (such as `ALTER TYPE jobstatus ADD VALUE`, `gen_random_uuid()`, and native PostgreSQL enum creation) are guarded behind dialect checks (`if bind.dialect.name == "postgresql":`).
+- Continuous integration runs an automated migration round-trip test (`alembic upgrade head -> alembic downgrade base -> alembic upgrade head`) on PostgreSQL 16 to guarantee schema reversibility.
+
+### 25.4 Segmented production deployment topology (`docker-compose.prod.yml`)
+The production topology strictly enforces network isolation, least privilege, and immutable container runtimes:
+- **Network Segmentation**:
+  - `pulse-internal`: Private bridge network with `internal: true`. Contains PostgreSQL, Redis, Celery worker fleets, Beat scheduler, and migration container. Containers on this network have zero direct external ingress.
+  - `pulse-ingress`: External bridge network connecting the Next.js frontend and FastAPI API to the reverse proxy / TLS terminator.
+- **Port Exposure**:
+  - PostgreSQL (5432) and Redis (6379) publish **zero host ports**.
+  - FastAPI API and Next.js Frontend are bound strictly to `127.0.0.1` (`127.0.0.1:8000` and `127.0.0.1:3000`), requiring traffic to traverse an audited TLS ingress proxy.
+- **One-Off Migration Gate**:
+  - The `migration` service executes `alembic upgrade head` upon deployment and shuts down cleanly (`restart: "no"`).
+  - API and Celery workers define `depends_on: migration: condition: service_completed_successfully`, preventing workers from processing jobs against outdated schemas.
+- **Worker Isolation & Container Hardening**:
+  - Multi-stage Docker builds without compilers or dev tools in runtime stages.
+  - Unprivileged system users (`UID 10001` for Python, `UID 1001` for Node.js) with `security_opt: [no-new-privileges:true]`.
+  - Zero source code bind mounts (`./backend:/app` omitted).
+  - Explicit CPU and memory resource limits across all services.
+  - Redis authentication enforced via `requirepass` with append-only persistence enabled.
+
+### 25.5 Automated database backups
+The production stack includes an automated backup service container (`backup`) that runs periodic `pg_dump` snapshots into a persistent Docker volume (`pulse_backups`), automatically compressing archives with gzip and purging backups older than 14 days.
+
+
 

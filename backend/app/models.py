@@ -280,6 +280,8 @@ class Job(Base):
 
     __table_args__ = (
         Index("ix_jobs_queue_status", "queue_id", "status"),
+        Index("ix_jobs_queue_created", "queue_id", "created_at"),
+        Index("ix_jobs_status_created", "status", "created_at"),
         UniqueConstraint("queue_id", "idempotency_key", name="uq_job_idempotency_per_queue"),
     )
 
@@ -387,6 +389,10 @@ class AuditLog(Base):
     user = relationship("User")
     organization = relationship("Organization")
 
+    __table_args__ = (
+        Index("ix_audit_logs_org_created", "org_id", "created_at"),
+    )
+
 
 class WebhookSubscription(Base):
     """Customer-registered HTTP webhook endpoints for asynchronous event notifications."""
@@ -432,6 +438,10 @@ class WebhookDelivery(Base):
     delivered_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
     subscription = relationship("WebhookSubscription", back_populates="deliveries")
+
+    __table_args__ = (
+        Index("ix_webhook_deliveries_sub_delivered", "subscription_id", "delivered_at"),
+    )
 
 
 class ScheduleOccurrence(Base):

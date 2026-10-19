@@ -16,9 +16,9 @@ from app.models import JobStatus, OrgMemberRole, RetryStrategy, UserRole, Worker
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8)
-    full_name: Optional[str] = None
-    organization_name: str
+    password: str = Field(min_length=8, max_length=128)
+    full_name: Optional[str] = Field(default=None, max_length=255)
+    organization_name: str = Field(min_length=1, max_length=120)
 
     @field_validator("password")
     @classmethod
@@ -127,8 +127,8 @@ class AdminStatsOut(BaseModel):
 # ---------- Projects ----------
 
 class ProjectCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
 
 
 class ProjectOut(BaseModel):
@@ -143,14 +143,14 @@ class ProjectOut(BaseModel):
 # ---------- Queues ----------
 
 class QueueCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=120)
     priority: int = Field(default=5, ge=1, le=10)
-    concurrency_limit: int = Field(default=4, ge=1)
+    concurrency_limit: int = Field(default=4, ge=1, le=1000)
 
 
 class QueueUpdate(BaseModel):
     priority: Optional[int] = Field(default=None, ge=1, le=10)
-    concurrency_limit: Optional[int] = Field(default=None, ge=1)
+    concurrency_limit: Optional[int] = Field(default=None, ge=1, le=1000)
     is_paused: Optional[bool] = None
 
 
@@ -180,10 +180,10 @@ class QueueStatsOut(BaseModel):
 # ---------- Retry Policies ----------
 
 class RetryPolicyCreate(BaseModel):
-    name: str = "default"
+    name: str = Field(default="default", min_length=1, max_length=120)
     strategy: RetryStrategy = RetryStrategy.EXPONENTIAL
     max_retries: int = Field(default=3, ge=0, le=20)
-    base_delay_seconds: int = Field(default=10, ge=1)
+    base_delay_seconds: int = Field(default=10, ge=1, le=86400)
 
 
 class RetryPolicyOut(RetryPolicyCreate):
@@ -195,20 +195,52 @@ class RetryPolicyOut(RetryPolicyCreate):
 
 # ---------- Jobs ----------
 
+MAX_JOB_PAYLOAD_BYTES = 262_144  # 256 KB
+
+
 class JobCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=255)
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: Optional[int] = Field(default=None, ge=1, le=10)  # None = inherit queue's priority
     run_at: Optional[datetime] = None  # None = run immediately
     max_retries: int = Field(default=3, ge=0, le=20)
-    retry_policy_id: Optional[str] = None
-    idempotency_key: Optional[str] = None
-    depends_on_job_id: Optional[str] = None
-    depends_on_job_ids: Optional[list[str]] = None
+    retry_policy_id: Optional[str] = Field(default=None, max_length=128)
+    idempotency_key: Optional[str] = Field(default=None, max_length=255)
+    depends_on_job_id: Optional[str] = Field(default=None, max_length=128)
+    depends_on_job_ids: Optional[list[str]] = Field(default=None, max_length=50)
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload_limits(cls, v: dict[str, Any]) -> dict[str, Any]:
+        import json
+        try:
+            serialized = json.dumps(v, default=str)
+        except Exception as exc:
+            raise ValueError(f"Payload must be JSON-serializable: {exc}")
+        if len(serialized.encode("utf-8")) > MAX_JOB_PAYLOAD_BYTES:
+            raise ValueError(f"Payload size ({len(serialized)} bytes) exceeds maximum limit of {MAX_JOB_PAYLOAD_BYTES} bytes (256 KB)")
+
+        if v.get("type") == "http":
+            url = v.get("url")
+            if url and len(str(url)) > 2048:
+                raise ValueError("HTTP job url exceeds 2048 characters limit")
+            headers = v.get("headers")
+            if headers:
+                if not isinstance(headers, dict):
+                    raise ValueError("HTTP job headers must be a key-value object")
+                if len(headers) > 50:
+                    raise ValueError("HTTP job headers cannot exceed 50 entries")
+                for k, val in headers.items():
+                    if len(str(k)) > 128 or len(str(val)) > 2048:
+                        raise ValueError(f"HTTP header '{k}' exceeds length limits (128 key / 2048 value)")
+            body = v.get("body")
+            if body and len(str(body).encode("utf-8")) > MAX_JOB_PAYLOAD_BYTES:
+                raise ValueError("HTTP job body exceeds 256 KB limit")
+        return v
 
 
 class JobBatchCreate(BaseModel):
-    jobs: list[JobCreate]
+    jobs: list[JobCreate] = Field(min_length=1, max_length=100)
 
 
 class JobOut(BaseModel):
@@ -291,8 +323,8 @@ class DAGGraphOut(BaseModel):
 # ---------- Schedules ----------
 
 class JobScheduleCreate(BaseModel):
-    name: str
-    cron_expression: str
+    name: str = Field(min_length=1, max_length=255)
+    cron_expression: str = Field(min_length=1, max_length=120)
     payload_template: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("cron_expression")
@@ -303,6 +335,18 @@ class JobScheduleCreate(BaseModel):
         if not croniter.is_valid(clean):
             raise ValueError(f"Invalid cron expression '{v}'. Must be a standard 5-field cron expression evaluated in UTC.")
         return clean
+
+    @field_validator("payload_template")
+    @classmethod
+    def validate_template_limits(cls, v: dict[str, Any]) -> dict[str, Any]:
+        import json
+        try:
+            serialized = json.dumps(v, default=str)
+        except Exception as exc:
+            raise ValueError(f"Payload template must be JSON-serializable: {exc}")
+        if len(serialized.encode("utf-8")) > MAX_JOB_PAYLOAD_BYTES:
+            raise ValueError(f"Payload template size ({len(serialized)} bytes) exceeds maximum limit of {MAX_JOB_PAYLOAD_BYTES} bytes (256 KB)")
+        return v
 
 
 class JobScheduleOut(BaseModel):
@@ -362,9 +406,9 @@ class AuditLogOut(BaseModel):
 # ---------- Webhooks ----------
 
 class WebhookSubscriptionCreate(BaseModel):
-    url: str
-    events: list[str] = Field(default_factory=lambda: ["*"])
-    description: Optional[str] = None
+    url: str = Field(min_length=1, max_length=2048)
+    events: list[str] = Field(default_factory=lambda: ["*"], min_length=1, max_length=20)
+    description: Optional[str] = Field(default=None, max_length=255)
 
 
 class WebhookSubscriptionUpdate(BaseModel):

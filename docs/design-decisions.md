@@ -1675,6 +1675,49 @@ Pulse introduces multi-layer perimeter, session, and network security hardening:
 
 ---
 
+## 42. Data integrity boundaries, multi-tenant queue isolation, migration reversibility, compound indexing, and segmented production deployment topology
+
+### Decision
+
+Pulse introduces end-to-end data integrity guarantees, strict tenant boundary validations, and an isolated production deployment topology:
+1. **Multi-Tenant Queue Isolation & Retry Policy Validation (`app.routers.jobs`)**:
+   - The job creation endpoints (`POST /projects/{project_id}/queues/{queue_id}/jobs` and `.../jobs/batch`) enforce strict ownership validation on referenced retry policies.
+   - If `payload.retry_policy_id` is supplied, the backend asserts `RetryPolicy.id == payload.retry_policy_id AND RetryPolicy.queue_id == queue.id`. Mismatches immediately abort with `HTTP 400 Bad Request` ("Retry policy not found or does not belong to this queue"), eliminating cross-tenant and cross-queue policy leaks.
+2. **Payload & Request Boundary Bounds (`app.schemas`)**:
+   - `JobCreate.payload`: validated with Pydantic field validators to ensure JSON serializability and capped at a maximum of **256 KB** (`MAX_JOB_PAYLOAD_BYTES = 262_144`).
+   - HTTP Jobs: Target URL capped at 2,048 characters; custom headers capped at 50 key-value pairs (max 128 chars key / 2,048 chars value); body capped at 256 KB.
+   - Batch Submissions: `JobBatchCreate.jobs` bounded to a maximum of 100 jobs per batch request.
+   - Entity Constraints: Project, Queue, Schedule, and Webhook Subscription names are bounded to 120 characters with non-empty constraints.
+3. **Keyset Cursor Pagination & Compound Performance Indexes (`app.routers.jobs`, `app.routers.audit`, `app.models`)**:
+   - To eliminate high-offset database performance degradation on high-volume listing endpoints (`/projects/.../jobs` and `/audit-logs`), Pulse implements keyset cursor pagination based on `created_at` timestamps.
+   - Endpoints fetch `limit + 1` rows to calculate `X-Has-More: true|false` and generate `X-Next-Cursor` without running full table counts.
+   - Added compound database indexes to prevent table scans:
+     - `ix_jobs_queue_created (queue_id, created_at DESC)`
+     - `ix_jobs_status_created (status, created_at DESC)`
+     - `ix_audit_logs_org_created (org_id, created_at DESC)`
+     - `ix_webhook_deliveries_sub_delivered (subscription_id, delivered_at DESC)`
+4. **Named Alembic Migration Constraints & Reversibility Verification (`backend/alembic/`)**:
+   - All foreign key constraints are explicitly named (`fk_jobs_depends_on_job_id`) in both `create_foreign_key` and `drop_constraint` calls.
+   - Postgres-specific DDL operations (`ALTER TYPE jobstatus ADD VALUE`, `gen_random_uuid()`) are dialect-guarded.
+   - Full migration round trips (`alembic upgrade head -> downgrade base -> upgrade head`) are verified automatically in CI.
+5. **Segmented Production Deployment Topology (`docker-compose.prod.yml`, `.env.production.example`)**:
+   - Production Docker Compose enforces network segmentation: private `pulse-internal` (internal: true) for PostgreSQL, Redis, Celery workers, Beat, and migration; public `pulse-ingress` for API and Frontend.
+   - PostgreSQL and Redis publish zero host ports.
+   - Redis enforces password authentication via `requirepass` with append-only persistence.
+   - API and Next.js frontend bind strictly to `127.0.0.1`.
+   - Migration runs as a one-off prerequisite container (`migration`) that gates API and worker startup.
+   - Automated daily database backup service container (`backup`) with 14-day gzip retention.
+
+### Why
+
+1. **Preventing Cross-Tenant Contamination**: Without explicit queue ownership checks, a tenant could pass an arbitrary `retry_policy_id` belonging to a competitor, causing unexpected backoff parameters or exposing policy IDs.
+2. **Defending Against Database Denial-of-Service**: Unbounded JSON payloads and batch arrays can exhaust database memory and WAL buffers. Strict 256 KB payload caps and 100-item batch limits protect database health.
+3. **Eliminating High-Offset Query Latency**: Classic `OFFSET N LIMIT M` queries scan and discard $N$ rows, causing quadratic latency growth on large tables. Keyset cursor pagination over indexed `created_at` timestamps guarantees constant $O(1)$ page traversal times.
+4. **Preventing Broken Rollbacks**: Unnamed foreign keys in Alembic prevent clean schema downgrades and break CI service testing. Explicit constraint names ensure zero-downtime, safe schema reversibility.
+5. **Zero-Trust Network Segmentation**: Production databases and in-memory caches must never expose ports to public host interfaces. Segmenting internal storage networks and requiring one-off migration gates guarantees operational stability.
+
+---
+
 ## Decision summary
 
 | Area | Chosen approach | Main reason |
@@ -1708,6 +1751,7 @@ Pulse introduces multi-layer perimeter, session, and network security hardening:
 | Centralized invitations | Shared domain service `create_organization_invite` | Guarantees identical audit event format and single-use token lifecycle |
 | Transactional outbox & race elimination | Durable `outbox_events` + row locking + atomic conditional update join resolution + occurrence uniqueness | Eliminates ghost dispatches, fan-in duplicate runs, and cron double ticks under concurrency |
 | Network & session security | Query-string JWT removal + single-use SSE tickets + trusted proxy IP + fail-closed auth + defense-in-depth SSRF + CSRF middleware | Prevents token logging leaks, proxy IP spoofing, DNS rebinding, cross-origin forgery, and monitoring exposure |
+| Data integrity & production topology | Cross-tenant retry checks + 256KB caps + keyset cursor pagination + named FK migrations + segmented prod compose | Guarantees multi-tenant isolation, constant-time pagination, reversible migrations, zero exposed DB ports, and automated backups |
 | CI/CD & multi-arch delivery | GitHub Actions + ephemeral services + Buildx QEMU | Automated verification across PostgreSQL 16 & Redis 7 with AMD64/ARM64 container images |
 | End-to-end browser testing | Playwright + isolated browser contexts + Next.js webServer | Real browser verification of auth cookies, queue controls, DAG graphs, and webhooks |
 

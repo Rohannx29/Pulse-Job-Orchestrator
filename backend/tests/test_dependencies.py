@@ -11,10 +11,24 @@ from unittest.mock import patch
 
 import pytest
 
-from app.database import SessionLocal
+from app.database import SessionLocal, engine
 from app.models import Job, JobStatus, Organization, Project, Queue, User
 from app.security import hash_password
 from app.tasks import _cascade_fail_dependents, _release_dependents
+
+
+def _is_db_available() -> bool:
+    try:
+        with engine.connect() as conn:
+            return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_db_available(),
+    reason="Database server is not reachable; live database dependency tests require a running database",
+)
 
 
 @pytest.fixture

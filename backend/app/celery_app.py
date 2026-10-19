@@ -94,6 +94,11 @@ celery_app.conf.beat_schedule = {
         "schedule": settings.PRUNE_INTERVAL_SECONDS,
         "options": {"queue": "pulse.internal"},
     },
+    "process-outbox-events": {
+        "task": "app.tasks.process_outbox_events",
+        "schedule": 5.0,  # poll every 5s for retrying background outbox events
+        "options": {"queue": "pulse.internal"},
+    },
 }
 
 # ---------------------------------------------------------------------------

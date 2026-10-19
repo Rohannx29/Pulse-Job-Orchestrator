@@ -19,12 +19,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Create new enum types in Postgres
-    user_role_enum = sa.Enum('system_admin', 'org_admin', 'member', name='userrole')
-    user_role_enum.create(op.get_bind(), checkfirst=True)
-
-    org_member_role_enum = sa.Enum('admin', 'member', name='orgmemberrole')
-    org_member_role_enum.create(op.get_bind(), checkfirst=True)
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        user_role_enum = sa.Enum('system_admin', 'org_admin', 'member', name='userrole')
+        user_role_enum.create(bind, checkfirst=True)
+        org_member_role_enum = sa.Enum('admin', 'member', name='orgmemberrole')
+        org_member_role_enum.create(bind, checkfirst=True)
 
     # 2. Add `role` column to users (default org_admin — preserves existing accounts)
     op.add_column(
@@ -60,22 +60,23 @@ def upgrade() -> None:
 
     # 4. Backfill: create OrganizationMember rows for existing org owners
     # so the new access control table is consistent with existing data.
-    op.execute("""
-        INSERT INTO organization_members (id, org_id, user_id, role, created_at)
-        SELECT gen_random_uuid(), id, owner_id, 'admin', created_at
-        FROM organizations
-        ON CONFLICT (org_id, user_id) DO NOTHING
-    """)
+    if bind.dialect.name == "postgresql":
+        op.execute("""
+            INSERT INTO organization_members (id, org_id, user_id, role, created_at)
+            SELECT gen_random_uuid(), id, owner_id, 'admin', created_at
+            FROM organizations
+            ON CONFLICT (org_id, user_id) DO NOTHING
+        """)
 
-    # 5. Promote the very first user to system_admin (oldest created_at).
-    # This is a best-effort bootstrap: on a fresh DB there's no user yet,
-    # so nothing happens. On an existing DB the original operator account
-    # becomes SYSTEM_ADMIN.
-    op.execute("""
-        UPDATE users
-        SET role = 'system_admin'
-        WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1)
-    """)
+        # 5. Promote the very first user to system_admin (oldest created_at).
+        # This is a best-effort bootstrap: on a fresh DB there's no user yet,
+        # so nothing happens. On an existing DB the original operator account
+        # becomes SYSTEM_ADMIN.
+        op.execute("""
+            UPDATE users
+            SET role = 'system_admin'
+            WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1)
+        """)
 
     # 6. Create invite_tokens table
     op.create_table(
@@ -99,6 +100,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
     op.drop_index('ix_invite_tokens_token_hash', table_name='invite_tokens')
     op.drop_index('ix_invite_tokens_email', table_name='invite_tokens')
     op.drop_index('ix_invite_tokens_org_id', table_name='invite_tokens')
@@ -110,5 +112,6 @@ def downgrade() -> None:
 
     op.drop_column('users', 'role')
 
-    sa.Enum(name='orgmemberrole').drop(op.get_bind(), checkfirst=True)
-    sa.Enum(name='userrole').drop(op.get_bind(), checkfirst=True)
+    if bind.dialect.name == "postgresql":
+        sa.Enum(name='orgmemberrole').drop(bind, checkfirst=True)
+        sa.Enum(name='userrole').drop(bind, checkfirst=True)

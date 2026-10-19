@@ -17,9 +17,10 @@ from app import models  # noqa: E402,F401  (import registers all models on Base.
 # access to the values within the .ini file in use.
 config = context.config
 
-# Always take the DB URL from app settings (env var-driven) rather than the
-# static alembic.ini, so migrations use the same DATABASE_URL as the app.
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Take the DB URL from app settings if not explicitly set programmatically
+existing_url = config.get_main_option("sqlalchemy.url")
+if not existing_url or "user:pass@localhost" in existing_url:
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -75,7 +76,9 @@ def run_migrations_online() -> None:
 
     with connectable.connect() as connection:
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,
         )
 
         with context.begin_transaction():

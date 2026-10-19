@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from app.database import get_db
 from app.deps import get_current_user, user_can_access_org
 from app.dispatch import dispatch_job
-from app.models import Job, JobExecution, JobStatus, Organization, Project, Queue, User
+from app.models import Job, JobExecution, JobStatus, Organization, Project, Queue, RetryPolicy, User
 from app.schemas import DAGGraphOut, JobBatchCreate, JobCreate, JobDetailOut, JobOut
 
 router = APIRouter(tags=["jobs"])
@@ -84,6 +84,17 @@ def create_job(
             response.status_code = 200
             return existing
 
+    if payload.retry_policy_id:
+        policy = db.query(RetryPolicy).filter(
+            RetryPolicy.id == payload.retry_policy_id,
+            RetryPolicy.queue_id == queue.id,
+        ).first()
+        if not policy:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Retry policy '{payload.retry_policy_id}' not found or does not belong to this queue",
+            )
+
     # Collect all parent dependency IDs (both legacy single field and multi-parent array)
     raw_parent_ids = (payload.depends_on_job_ids or []) + ([payload.depends_on_job_id] if payload.depends_on_job_id else [])
     parent_job_ids = list(dict.fromkeys(pid for pid in raw_parent_ids if pid))
@@ -150,6 +161,16 @@ def create_jobs_batch(
     batch_id = str(uuid.uuid4())
     jobs = []
     for item in payload.jobs:
+        if item.retry_policy_id:
+            policy = db.query(RetryPolicy).filter(
+                RetryPolicy.id == item.retry_policy_id,
+                RetryPolicy.queue_id == queue.id,
+            ).first()
+            if not policy:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Retry policy '{item.retry_policy_id}' not found or does not belong to this queue",
+                )
         item_data = item.model_dump()
         item_data["priority"] = item.priority if item.priority is not None else queue.priority
         job = Job(queue_id=queue.id, batch_id=batch_id, **item_data)
@@ -169,9 +190,11 @@ def create_jobs_batch(
 def list_jobs(
     project_id: str,
     queue_id: str,
+    response: Response,
     status_filter: JobStatus | None = Query(default=None, alias="status"),
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, description="Cursor for timestamp-based keyset pagination"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -179,7 +202,29 @@ def list_jobs(
     q = db.query(Job).filter(Job.queue_id == queue.id)
     if status_filter:
         q = q.filter(Job.status == status_filter)
-    return q.order_by(Job.created_at.desc()).offset(skip).limit(min(limit, 200)).all()
+    if cursor:
+        try:
+            from datetime import datetime
+            cursor_dt = datetime.fromisoformat(cursor)
+            q = q.filter(Job.created_at < cursor_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid cursor format; ISO 8601 datetime expected")
+    
+    fetch_limit = min(limit, 100)
+    items = q.order_by(Job.created_at.desc()).offset(skip).limit(fetch_limit + 1).all()
+    if len(items) > fetch_limit:
+        has_more = True
+        items = items[:fetch_limit]
+        next_cursor = items[-1].created_at.isoformat()
+    else:
+        has_more = False
+        next_cursor = None
+
+    response.headers["X-Has-More"] = "true" if has_more else "false"
+    if next_cursor:
+        response.headers["X-Next-Cursor"] = next_cursor
+
+    return items
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetailOut)
