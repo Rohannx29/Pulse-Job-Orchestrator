@@ -480,3 +480,175 @@ High-throughput distributed systems require predictable database latency under h
 ### 19.2 Connection pool hygiene
 - **Pre-Ping & Recycling**: Database engines are configured with `pool_pre_ping=True` and connection recycling (`pool_recycle=1800`) to detect and discard stale or severed TCP sockets before handing connections to request handlers.
 - **Fail-Open Resilience**: Operational dependencies (Redis rate limiters, pub/sub event emitters, and concurrency semaphores) are isolated within fail-open try/except blocks to guarantee that transient caching or message broker blips never cascade into API 500 downtime.
+
+## 20. Outbound webhook delivery engine and HMAC security
+
+Pulse features an enterprise-grade outbound webhook delivery engine enabling customers to receive push notifications at external HTTP endpoints whenever platform events occur (`job.created`, `job.completed`, `job.failed`, `job.dead_letter`, `job.retried`):
+
+```text
+Platform Event (e.g. Job Completed / State Change)
+                        ↓
+                 `publish_event`
+           (Redis Pub/Sub SSE Bridge)
+                        ↓
+            `dispatch_webhooks_for_event`
+     (Matches WebhookSubscriptions by org_id & events)
+                        ↓
+          Creates `WebhookDelivery` Record
+                        ↓
+          Enqueues `app.tasks.deliver_webhook`
+             (Queue: `pulse.internal`)
+                        ↓
+       Celery Worker `execute_delivery`:
+         ├── 1. SSRF Validation (`validate_public_url`)
+         │      Blocks loopback, RFC1918, 169.254.169.254
+         ├── 2. Envelope & HMAC-SHA256 Signatures
+         │      Headers: X-Pulse-Signature (v1=...), X-Pulse-Timestamp
+         ├── 3. Outbound POST with strict timeout (10s)
+         ├── 4. Response capture (capped at 2KB) & duration tracking
+         ├── 5. Prometheus Telemetry (`pulse_webhook_deliveries_total`)
+         └── 6. Transient Failure Retries (Exponential backoff: 5s, 25s, 125s)
+```
+
+### 20.1 SSRF protection
+Before any socket or HTTP connection is initiated, the destination URL undergoes strict DNS resolution and IP validation via `validate_public_url`:
+- Prohibits loopback interfaces (`127.0.0.0/8`, `::1`).
+- Prohibits private RFC 1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
+- Prohibits cloud metadata IP addresses (`169.254.169.254`, `169.254.170.2`).
+- Restricts protocols strictly to `http://` and `https://`.
+
+### 20.2 Cryptographic HMAC-SHA256 signatures & replay prevention
+Each webhook subscription receives a cryptographically secure signing secret (`whsec_...` generated via `secrets.token_hex(24)`). Webhook payloads are signed using:
+```text
+signature = "v1=" + HMAC_SHA256(secret, timestamp + "." + json_payload)
+```
+Receivers verify authenticity using constant-time string comparison (`hmac.compare_digest`) and reject any requests where `|current_time - timestamp| > 300` seconds (5-minute tolerance window), completely mitigating replay attacks.
+
+### 20.3 Worker queue segregation & retry backoff
+Outbound webhook deliveries are routed exclusively to the internal management pool (`pulse.internal`), preventing third-party server latency or timeouts from blocking customer task queues (`pulse.high`, `pulse.normal`, `pulse.low`). Transient delivery failures (5xx HTTP status codes or connection timeouts) trigger exponential backoff retries (5s, 25s, 125s), while deterministic client errors (4xx) and SSRF violations fail immediately without retry.
+
+## 21. Multi-parent Directed Acyclic Graph (DAG) workflows
+
+Pulse provides enterprise workflow orchestration supporting arbitrary Directed Acyclic Graphs (DAGs) with multi-parent fan-in (synchronization barriers), multi-child fan-out (parallel branching), and complex diamond topologies:
+
+```text
+       ┌───────────┐
+       │   Job A   │ (Completed)
+       └─────┬─────┘
+             │ (Fan-Out)
+       ┌─────┴─────┐
+       ▼           ▼
+  ┌─────────┐ ┌─────────┐
+  │  Job B  │ │  Job C  │
+  └────┬────┘ └────┬────┘
+       │ (Fan-In)  │
+       └─────┬─────┘
+             ▼
+       ┌───────────┐
+       │   Job D   │ (Waits for BOTH B & C)
+       └───────────┘
+```
+
+### 21.1 Join table architecture & backward compatibility
+Dependencies are decoupled from the core `jobs` table into a dedicated `job_dependencies` join table:
+- **Composite Primary Key**: `(parent_job_id, child_job_id)` enforcing uniqueness of dependency edges.
+- **Cascading Deletion**: Deleting a parent or child job cascades automatically to its edge records.
+- **Legacy Compatibility**: The single-parent `Job.depends_on_job_id` attribute is fully preserved as a legacy convenience pointer and is automatically synchronized with `job_dependencies`.
+
+### 21.2 Real-time cycle detection (DFS)
+Before any dependency relationship is persisted, `detect_cycle_dfs` executes a Depth-First Search following downstream dependency edges from the proposed child job:
+- If any node in the proposed parent set is reachable from the child, adding the proposed edge would close a directed loop (`parent -> child -> ... -> parent`).
+- Requests attempting to create circular dependencies (self-loops `A -> A`, direct cycles `A -> B -> A`, or transitive multi-hop cycles `A -> B -> C -> D -> A`) are rejected immediately with HTTP 400 Bad Request, preventing distributed deadlocks.
+
+### 21.3 Non-blocking join resolution
+When a parent task finishes successfully, `release_dag_dependents`:
+1. Discovers all direct children waiting on that parent.
+2. Evaluates the completion status of **ALL** prerequisite parents for each child.
+3. If all parent tasks are `COMPLETED`, the child transitions from `BLOCKED` to `QUEUED` and is dispatched to the priority worker pool.
+4. If one or more prerequisite tasks remain active, the child remains safely in `BLOCKED` state until the final parent completes.
+
+### 21.4 Cascading failure propagation
+If any prerequisite task in an upstream branch permanently fails and exhausts retries (`DEAD_LETTER`):
+1. Downstream join nodes can never satisfy all required prerequisites.
+2. `cascade_fail_dag_dependents` recursively transitions all downstream dependents in `BLOCKED` state to `DEAD_LETTER`.
+3. Records explicit failure provenance in `dead_letter_jobs` (`reason="Upstream prerequisite {id} failed: ..."`).
+4. Emits real-time SSE event `job.dead_letter` for operator observability.
+
+## 22. Continuous Integration & Multi-Architecture Deployment Pipeline
+
+Pulse employs an automated GitHub Actions CI/CD pipeline (`.github/workflows/ci.yml`) enforcing static quality gates, database migration verification, end-to-end unit and integration testing, and multi-architecture container artifact generation:
+
+```text
+┌─────────────────┐     ┌──────────────────┐
+│   backend-ci    │     │   frontend-ci    │
+│ (Py3.12, PG16,  │     │ (Node 20, Next)  │
+│  Redis7, Ruff)  │     │ (TSC, Build)     │
+└────────┬────────┘     └────────┬─────────┘
+         │                       │
+         └───────────┬───────────┘
+                     ▼
+       ┌───────────────────────────┐
+       │    compose-smoke-test     │
+       │ (docker compose up/health)│
+       └─────────────┬─────────────┘
+                     ▼
+       ┌───────────────────────────┐
+       │   docker-multiarch-build  │
+       │ (linux/amd64,linux/arm64) │
+       │     (GHCR + GHA Cache)    │
+       └───────────────────────────┘
+```
+
+### 22.1 Ephemeral service containers & migration testing
+The backend test job provisions dedicated PostgreSQL 16 and Redis 7 service containers with health checks. The pipeline executes:
+1. **Static Analysis**: Fast static code inspection via `ruff`.
+2. **Migration Upgrade Verification**: Direct execution of `alembic upgrade head` verifying that the full revision graph applies cleanly against fresh PostgreSQL storage.
+3. **Full Integration Testing**: Pytest suite execution across all priority queues, Redis ownership leases, concurrency semaphores, and database state machines with XML coverage reports.
+
+### 22.2 Frontend validation & static generation
+The frontend pipeline job uses Node.js 20 to:
+1. Enforce strict TypeScript compilation (`tsc --noEmit`).
+2. Verify production Next.js standalone bundling (`npm run build`) across all 17 console routes and middleware.
+
+### 22.3 End-to-end compose smoke test
+The pipeline exercises `docker-compose.yml` by bringing up all 9 containers (PostgreSQL, Redis, API, internal worker, high/normal/low priority workers, Beat, Flower, and dashboard). It queries `/health` and `/health/live` to guarantee complete container readiness and curl verification before publishing images.
+
+### 22.4 Multi-architecture Docker delivery (`linux/amd64`, `linux/arm64`)
+Using QEMU and Docker Buildx, the build job compiles native multi-architecture images for both Intel/AMD64 servers and ARM64 cloud instances (e.g. AWS Graviton, Apple Silicon). Images are tagged semantically and published to GitHub Container Registry (GHCR) with GitHub Actions build layer caching (`type=gha`) for sub-minute incremental builds.
+
+## 23. End-to-End Automated Testing & Quality Assurance Architecture
+
+Pulse includes an enterprise browser automation testing framework built on **Playwright** (`frontend/e2e/`), simulating realistic operator journeys across isolated browser contexts:
+
+```text
+┌────────────────────────────────────────────────────────┐
+│                   Playwright Test Runner               │
+│               (Chromium, WebServer Automation)         │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│  auth.spec   │   │ queues.spec  │   │jobs-dag.spec │
+│(Registration,│   │(Creation,    │   │(Fan-In/Out,  │
+│ Login, Guard)│   │ Pause/Resume)│   │ DAG Topology)│
+└──────────────┘   └──────────────┘   └──────────────┘
+        │                  │
+        ▼                  ▼
+┌──────────────┐   ┌──────────────┐
+│webhooks.spec │   │audit-log.spec│
+│(HMAC Secret, │   │(Compliance,  │
+│ Test Ping)   │   │ Filters)     │
+└──────────────┘   └──────────────┘
+```
+
+### 23.1 Isolated synthetic tenants & session lifecycle
+Every test spec provisions an isolated tenant organization and operator account via `registerAndLogin` in `frontend/e2e/helpers.ts`. Tests exercise real cookie-based session persistence (`pulse_access_token`), edge middleware authentication redirects (`/login?next=...`), password length constraints, and explicit session termination upon logout.
+
+### 23.2 State machine & UI interactive verification
+- **Queue Controls**: Validates project pre-selection, queue registration, and dynamic pause/resume button toggling with immediate badge status updates.
+- **DAG Workflow Topology**: Tests multi-parent dependency declaration in the job explorer, verifies prerequisite checklist indicators on `/jobs/[id]`, and asserts that the SVG/Canvas DAG topology diagram renders parent-child directed edges accurately.
+- **Outbound Webhooks**: Verifies secret generation (`whsec_...`), interactive masking/revealing controls, manual test ping execution, and delivery audit drawer expansion.
+- **Audit Logs Explorer**: Asserts that immutable administrative mutations appear in real-time with actor attribution, verifying action and resource type dropdown filters.
+
+

@@ -202,6 +202,8 @@ export interface Job {
   max_retries: number;
   current_retry_count: number;
   celery_task_id?: string | null;
+  depends_on_job_id?: string | null;
+  depends_on_job_ids?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -289,5 +291,122 @@ export async function getSystemHealth(): Promise<SystemHealth> {
       },
     };
   }
+}
+
+// ---------- Webhook Types & API ----------
+
+export interface WebhookSubscription {
+  id: string;
+  org_id: string;
+  url: string;
+  secret: string;
+  events: string[];
+  is_active: boolean;
+  description?: string | null;
+  created_at: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  subscription_id: string;
+  event: string;
+  payload: Record<string, unknown>;
+  status_code?: number | null;
+  response_body?: string | null;
+  error_message?: string | null;
+  attempt_number: number;
+  duration_ms?: number | null;
+  is_success: boolean;
+  delivered_at: string;
+}
+
+export interface WebhookTestResponse {
+  status: string;
+  delivery_id: string;
+  status_code?: number | null;
+  is_success: boolean;
+  duration_ms?: number | null;
+}
+
+export async function getWebhooks(): Promise<WebhookSubscription[]> {
+  return api<WebhookSubscription[]>("/orgs/me/webhooks");
+}
+
+export async function createWebhook(data: {
+  url: string;
+  events?: string[];
+  description?: string;
+}): Promise<WebhookSubscription> {
+  return api<WebhookSubscription>("/orgs/me/webhooks", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateWebhook(
+  id: string,
+  data: {
+    url?: string;
+    events?: string[];
+    is_active?: boolean;
+    description?: string;
+  }
+): Promise<WebhookSubscription> {
+  return api<WebhookSubscription>(`/orgs/me/webhooks/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteWebhook(id: string): Promise<{ status: string; id: string }> {
+  return api<{ status: string; id: string }>(`/orgs/me/webhooks/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export async function testWebhook(id: string): Promise<WebhookTestResponse> {
+  return api<WebhookTestResponse>(`/orgs/me/webhooks/${id}/test`, {
+    method: "POST",
+  });
+}
+
+export async function getWebhookDeliveries(id: string, limit = 50): Promise<WebhookDelivery[]> {
+  return api<WebhookDelivery[]>(`/orgs/me/webhooks/${id}/deliveries?limit=${limit}`);
+}
+
+// ---------- DAG Workflows ----------
+
+export interface DAGNode {
+  id: string;
+  name: string;
+  queue_id: string;
+  queue_name?: string;
+  status: string;
+  priority: number;
+  current_retry_count: number;
+  max_retries: number;
+  parent_job_ids: string[];
+  run_at?: string | null;
+  created_at: string;
+}
+
+export interface DAGEdge {
+  parent_id: string;
+  child_id: string;
+}
+
+export interface DAGGraph {
+  root_job_id?: string | null;
+  nodes: DAGNode[];
+  edges: DAGEdge[];
+  is_acyclic: boolean;
+}
+
+export async function getJobDag(jobId: string): Promise<DAGGraph> {
+  return api<DAGGraph>(`/jobs/${jobId}/dag`);
+}
+
+export async function getProjectDag(projectId: string): Promise<DAGGraph> {
+  return api<DAGGraph>(`/projects/${projectId}/dag`);
 }
 

@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -113,6 +114,7 @@ class Organization(Base):
     projects = relationship("Project", back_populates="organization", cascade="all, delete-orphan")
     members = relationship("OrganizationMember", back_populates="organization", cascade="all, delete-orphan")
     invite_tokens = relationship("InviteToken", back_populates="organization", cascade="all, delete-orphan")
+    webhook_subscriptions = relationship("WebhookSubscription", back_populates="organization", cascade="all, delete-orphan")
 
 
 class OrganizationMember(Base):
@@ -251,10 +253,45 @@ class Job(Base):
     executions = relationship("JobExecution", back_populates="job", cascade="all, delete-orphan")
     dead_letter_entry = relationship("DeadLetterJob", back_populates="job", uselist=False, cascade="all, delete-orphan")
     dependents = relationship("Job", backref=backref("depends_on", remote_side=[id]))
+    child_dependencies = relationship("JobDependency", foreign_keys="[JobDependency.parent_job_id]", back_populates="parent_job", cascade="all, delete-orphan")
+    parent_dependencies = relationship("JobDependency", foreign_keys="[JobDependency.child_job_id]", back_populates="child_job", cascade="all, delete-orphan")
+
+    @property
+    def parent_job_ids(self) -> list[str]:
+        """Returns all prerequisite parent job IDs from the multi-parent DAG join table,
+        falling back to legacy single-parent depends_on_job_id if empty."""
+        if self.parent_dependencies:
+            return [str(dep.parent_job_id) for dep in self.parent_dependencies]
+        if self.depends_on_job_id:
+            return [str(self.depends_on_job_id)]
+        return []
+
+    @property
+    def depends_on_job_ids(self) -> list[str]:
+        """Alias for parent_job_ids matching API schema."""
+        return self.parent_job_ids
 
     __table_args__ = (
         Index("ix_jobs_queue_status", "queue_id", "status"),
         UniqueConstraint("queue_id", "idempotency_key", name="uq_job_idempotency_per_queue"),
+    )
+
+
+class JobDependency(Base):
+    """Join table supporting arbitrary directed acyclic graph (DAG) workflows
+    with multi-parent fan-in and multi-child fan-out."""
+    __tablename__ = "job_dependencies"
+
+    parent_job_id = Column(UUID(as_uuid=False), ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
+    child_job_id = Column(UUID(as_uuid=False), ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    parent_job = relationship("Job", foreign_keys=[parent_job_id], back_populates="child_dependencies")
+    child_job = relationship("Job", foreign_keys=[child_job_id], back_populates="parent_dependencies")
+
+    __table_args__ = (
+        Index("ix_job_dependencies_child", "child_job_id"),
+        Index("ix_job_dependencies_parent", "parent_job_id"),
     )
 
 
@@ -342,4 +379,43 @@ class AuditLog(Base):
 
     user = relationship("User")
     organization = relationship("Organization")
+
+
+class WebhookSubscription(Base):
+    """Customer-registered HTTP webhook endpoints for asynchronous event notifications."""
+
+    __tablename__ = "webhook_subscriptions"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    org_id = Column(UUID(as_uuid=False), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    url = Column(String(2048), nullable=False)
+    secret = Column(String(255), nullable=False)  # Cryptographically random HMAC-SHA256 signing secret
+    events = Column(JSONB, nullable=False, default=list)  # e.g. ["job.completed", "job.failed", "job.dead_letter"] or ["*"]
+    is_active = Column(Boolean, default=True, nullable=False)
+    description = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    organization = relationship("Organization", back_populates="webhook_subscriptions")
+    deliveries = relationship("WebhookDelivery", back_populates="subscription", cascade="all, delete-orphan")
+
+
+class WebhookDelivery(Base):
+    """Historical delivery log for each outbound webhook attempt."""
+
+    __tablename__ = "webhook_deliveries"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    subscription_id = Column(UUID(as_uuid=False), ForeignKey("webhook_subscriptions.id", ondelete="CASCADE"), nullable=False, index=True)
+    event = Column(String(100), nullable=False, index=True)
+    payload = Column(JSONB, nullable=False)
+    status_code = Column(Integer, nullable=True)
+    response_body = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    attempt_number = Column(Integer, default=1, nullable=False)
+    duration_ms = Column(Float, nullable=True)
+    is_success = Column(Boolean, default=False, nullable=False)
+    delivered_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+    subscription = relationship("WebhookSubscription", back_populates="deliveries")
+
 

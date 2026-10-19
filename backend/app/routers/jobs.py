@@ -8,7 +8,7 @@ from app.database import get_db
 from app.deps import get_current_user, user_can_access_org
 from app.dispatch import dispatch_job
 from app.models import Job, JobExecution, JobStatus, Organization, Project, Queue, User
-from app.schemas import JobBatchCreate, JobCreate, JobDetailOut, JobOut
+from app.schemas import DAGGraphOut, JobBatchCreate, JobCreate, JobDetailOut, JobOut
 
 router = APIRouter(tags=["jobs"])
 
@@ -84,51 +84,35 @@ def create_job(
             response.status_code = 200
             return existing
 
-    dependency: Job | None = None
-    if payload.depends_on_job_id:
-        dependency = _get_owned_job(db, payload.depends_on_job_id, user)
-        # Note: a dependency cycle is structurally impossible here — a job
-        # can only depend on an already-existing job, and depends_on_job_id
-        # is set once at creation and never updated, so the dependency
-        # graph can only ever point "backward" in time.
+    # Collect all parent dependency IDs (both legacy single field and multi-parent array)
+    raw_parent_ids = (payload.depends_on_job_ids or []) + ([payload.depends_on_job_id] if payload.depends_on_job_id else [])
+    parent_job_ids = list(dict.fromkeys(pid for pid in raw_parent_ids if pid))
 
-    job_data = payload.model_dump()
+    for pid in parent_job_ids:
+        _get_owned_job(db, pid, user)
+
+    job_data = payload.model_dump(exclude={"depends_on_job_ids"})
     # Queue.priority is the default; an explicit Job.priority overrides it.
-    # Materialized onto the Job row at creation time (rather than resolved
-    # at dispatch/read time) so routing and display never need a Queue
-    # join just to know a job's effective priority.
     job_data["priority"] = payload.priority if payload.priority is not None else queue.priority
     job = Job(queue_id=queue.id, **job_data)
-    if dependency is not None and dependency.status != JobStatus.COMPLETED:
-        # Held back until the dependency finishes — see tasks.py, which
-        # dispatches BLOCKED dependents once their parent completes (or
-        # cascades them to dead_letter if the parent does instead).
-        job.status = JobStatus.BLOCKED
-        db.add(job)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            existing = (
-                db.query(Job)
-                .filter(Job.queue_id == queue.id, Job.idempotency_key == payload.idempotency_key)
-                .first()
-            )
-            if existing:
-                response.status_code = 200
-                return existing
-            raise
-        db.commit()
-        db.refresh(job)
-        return job
-
     db.add(job)
+
+    # Link DAG dependencies and evaluate initial state (BLOCKED, DEAD_LETTER, or QUEUED)
+    if parent_job_ids:
+        try:
+            from app.dag import link_dag_dependencies
+            initial_status = link_dag_dependencies(db, job, parent_job_ids)
+            job.status = initial_status
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         db.flush()
     except IntegrityError:
         # Race: another request with the same idempotency_key committed
         # between our check above and this flush. Return that one instead
-        # of erroring — that's the whole point of an idempotency key.
+        # of erroring.
         db.rollback()
         existing = (
             db.query(Job)
@@ -139,13 +123,15 @@ def create_job(
             response.status_code = 200
             return existing
         raise
-    # Commit BEFORE dispatching to Celery — otherwise a worker could in
-    # theory pop the task and query for this job before its row is even
-    # visible in Postgres. Small window, real bug if it hit.
-    db.commit()
-    _dispatch(job)
+
+    # Commit BEFORE dispatching to Celery
     db.commit()
     db.refresh(job)
+
+    # Only dispatch if not held back by uncompleted dependencies
+    if job.status == JobStatus.QUEUED:
+        _dispatch(job)
+
     return job
 
 
@@ -258,4 +244,30 @@ def retry_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(g
     db.commit()
     db.refresh(job)
     return job
+
+
+@router.get("/jobs/{job_id}/dag", response_model=DAGGraphOut)
+def get_job_dag(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Retrieve the connected DAG topology (ancestors and descendants) for a specific job."""
+    _get_owned_job(db, job_id, user)
+    from app.dag import build_dag_graph
+    return build_dag_graph(db, root_job_id=job_id)
+
+
+@router.get("/projects/{project_id}/dag", response_model=DAGGraphOut)
+def get_project_dag(
+    project_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Retrieve all DAG workflow jobs and dependency edges for an entire project."""
+    project = db.get(Project, project_id)
+    if not project or not user_can_access_org(db, user, project.org_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    from app.dag import build_dag_graph
+    return build_dag_graph(db, project_id=project_id)
 

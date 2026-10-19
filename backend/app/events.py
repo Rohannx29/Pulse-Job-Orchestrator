@@ -55,6 +55,18 @@ def publish_event(org_id: str, event_type: str, data: dict[str, Any]) -> None:
     except Exception as exc:
         logger.warning("Failed to publish SSE event %s to org %s: %s", event_type, org_id, exc)
 
+    # Outbound webhook delivery bridge
+    try:
+        from app.database import SessionLocal
+        from app.webhooks import dispatch_webhooks_for_event
+        db = SessionLocal()
+        try:
+            dispatch_webhooks_for_event(db, str(org_id), event_type, data)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("Failed to dispatch outbound webhooks for org %s event %s: %s", org_id, event_type, exc)
+
 
 def get_job_org_id(db, job) -> str | None:
     """Safely traverses job -> queue -> project -> org_id."""

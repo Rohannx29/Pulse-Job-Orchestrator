@@ -204,6 +204,7 @@ class JobCreate(BaseModel):
     retry_policy_id: Optional[str] = None
     idempotency_key: Optional[str] = None
     depends_on_job_id: Optional[str] = None
+    depends_on_job_ids: Optional[list[str]] = None
 
 
 class JobBatchCreate(BaseModel):
@@ -221,8 +222,9 @@ class JobOut(BaseModel):
     max_retries: int
     current_retry_count: int
     celery_task_id: Optional[str]
-    depends_on_job_id: Optional[str]
-    claimed_by_worker_id: Optional[str]
+    depends_on_job_id: Optional[str] = None
+    depends_on_job_ids: list[str] = Field(default_factory=list)
+    claimed_by_worker_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -254,6 +256,36 @@ class JobExecutionOut(BaseModel):
 
 class JobDetailOut(JobOut):
     executions: list[JobExecutionOut] = []
+
+
+# ---------- DAG Workflows ----------
+
+class DAGNode(BaseModel):
+    id: str
+    name: str
+    queue_id: str
+    queue_name: Optional[str] = None
+    status: JobStatus
+    priority: int
+    current_retry_count: int
+    max_retries: int
+    parent_job_ids: list[str] = Field(default_factory=list)
+    run_at: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DAGEdge(BaseModel):
+    parent_id: str
+    child_id: str
+
+
+class DAGGraphOut(BaseModel):
+    root_job_id: Optional[str] = None
+    nodes: list[DAGNode] = Field(default_factory=list)
+    edges: list[DAGEdge] = Field(default_factory=list)
+    is_acyclic: bool = True
 
 
 # ---------- Schedules ----------
@@ -316,4 +348,57 @@ class AuditLogOut(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Webhooks ----------
+
+class WebhookSubscriptionCreate(BaseModel):
+    url: str
+    events: list[str] = Field(default_factory=lambda: ["*"])
+    description: Optional[str] = None
+
+
+class WebhookSubscriptionUpdate(BaseModel):
+    url: Optional[str] = None
+    events: Optional[list[str]] = None
+    is_active: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class WebhookSubscriptionOut(BaseModel):
+    id: str
+    org_id: str
+    url: str
+    secret: str
+    events: list[str]
+    is_active: bool
+    description: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WebhookDeliveryOut(BaseModel):
+    id: str
+    subscription_id: str
+    event: str
+    payload: dict[str, Any]
+    status_code: Optional[int] = None
+    response_body: Optional[str] = None
+    error_message: Optional[str] = None
+    attempt_number: int
+    duration_ms: Optional[float] = None
+    is_success: bool
+    delivered_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WebhookTestResponse(BaseModel):
+    status: str
+    delivery_id: str
+    status_code: Optional[int] = None
+    is_success: bool
+    duration_ms: Optional[float] = None
+
 

@@ -42,7 +42,7 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Retry/backoff | ✅ | Fixed, linear, exponential strategy |
 | Dead-letter queue | ✅ | Manual retry supported |
 | Idempotency | ✅ | `(queue_id, idempotency_key)` uniqueness |
-| Job dependencies | ✅ | Single dependency + recursive failure cascade |
+| Job dependencies & Multi-Parent DAGs | ✅ | Arbitrary directed acyclic graphs (DAGs), multi-parent fan-in, multi-child fan-out, DFS cycle detection, non-blocking join resolution, recursive cascade failure |
 | Queue pause/resume | ✅ | Already-dispatched work is also deferred |
 | Per-queue concurrency | ✅ | Redis ownership-aware lease semaphore |
 | Priority isolation | ✅ | Dedicated high/normal/low worker pools |
@@ -60,6 +60,9 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 | Prometheus metrics & deep healthchecks | ✅ | Prometheus format (0.0.4) exposition (`/metrics`), deep readiness probe (`/health`), and liveness probe (`/health/live`) |
 | Production deployment hardening | ✅ | Multi-stage Docker builds, non-root users (`pulse:pulse`, `nextjs:nodejs`), `no-new-privileges`, healthchecks, restart policies |
 | Data retention & table pruning | ✅ | Automated Celery Beat batch pruning (`pulse.internal`) & admin trigger (`POST /admin/prune`) for heartbeats, logs, executions, and terminal jobs |
+| Outbound Webhooks & HMAC Signatures | ✅ | Cryptographic HMAC-SHA256 (`whsec_...`), replay attack tolerance window, SSRF protection, Celery delivery worker (`pulse.internal`), and delivery logs |
+| CI/CD & Multi-Arch Container Builds | ✅ | GitHub Actions workflow with PostgreSQL 16 & Redis 7 service containers, Ruff linting, coverage reporting, Next.js build verification, Docker Compose smoke tests, and Buildx multi-arch images (`linux/amd64`, `linux/arm64`) |
+| End-to-End Testing (Playwright) | ✅ | Automated browser test suite covering registration, auth lifecycle, project/queue management, multi-parent DAG workflow inspection, outbound webhooks, and audit logs |
 
 
 ## Repository structure
@@ -68,6 +71,9 @@ For the detailed design, see [Architecture](docs/architecture.md), [Design Decis
 pulse/
 ├── README.md
 ├── docker-compose.yml
+├── .github/
+│   └── workflows/
+│       └── ci.yml                 # Automated testing, linting, Next.js build & multi-arch container delivery
 │
 ├── backend/
 │   ├── Dockerfile
@@ -84,26 +90,30 @@ pulse/
 │   │   ├── security.py             # password/token helpers
 │   │   ├── celery_app.py           # Celery configuration
 │   │   ├── dispatch.py             # common job-dispatch path
-│   │   ├── tasks.py                # execution/retry/DLQ/cron/heartbeat
+│   │   ├── tasks.py                # execution/retry/DLQ/cron/heartbeat/webhooks
 │   │   ├── priority.py             # priority → Celery queue mapping
 │   │   ├── concurrency.py          # Redis queue semaphore
 │   │   ├── worker_registry.py      # worker identity/lifecycle
 │   │   ├── url_safety.py           # SSRF protections
 │   │   ├── audit.py                # immutable audit logging helper
 │   │   ├── events.py               # Redis Pub/Sub real-time event publisher
+│   │   ├── webhooks.py             # Outbound webhook signing, SSRF validation & delivery engine
+│   │   ├── dag.py                  # Multi-parent DAG engine, DFS cycle detection & join resolution
 │   │   ├── rate_limiter.py         # Redis sliding-window rate limiter
 │   │   ├── auth_hardening.py       # account lockout and brute-force defenses
 │   │   ├── logging_config.py       # structured JSON logging & correlation IDs
 │   │   ├── metrics.py              # Prometheus metrics registry, gauges & collectors
 │   │   ├── retention.py            # automated batch data retention & table pruning
-│   │   └── routers/                # API route modules (jobs, queues, dlq, schedules, workers, projects, orgs, admin, audit, events, health, auth)
+│   │   └── routers/                # API route modules (jobs, queues, dlq, schedules, workers, projects, orgs, webhooks, admin, audit, events, health, auth)
 │   └── tests/                      # unit + integration tests
 │
 ├── frontend/
-│   ├── app/                        # Next.js routes/pages (dashboard, jobs, queues, schedules, workers, dlq, projects, team, admin, audit-logs, auth)
+│   ├── app/                        # Next.js routes/pages (dashboard, jobs, queues, schedules, workers, dlq, webhooks, projects, team, admin, audit-logs, auth)
+│   ├── e2e/                        # Playwright automated browser test specs (auth, queues, jobs-dag, webhooks, audit-logs)
 │   ├── middleware.ts               # session verification route guard
 │   ├── lib/api.ts                  # API client
-│   └── lib/useEvents.ts            # Server-Sent Events React hook
+│   ├── lib/useEvents.ts            # Server-Sent Events React hook
+│   └── playwright.config.ts        # Playwright E2E browser test runner configuration
 │
 └── docs/
     ├── architecture.md

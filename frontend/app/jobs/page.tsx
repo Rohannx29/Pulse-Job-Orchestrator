@@ -98,6 +98,11 @@ export default function JobsPage() {
     e.preventDefault();
     setFormError(null);
     if (!jobName.trim() || !queueId) return;
+    const parentIds = dependsOnId
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     try {
       await api(`/projects/${projectId}/queues/${queueId}/jobs`, {
         method: "POST",
@@ -108,7 +113,7 @@ export default function JobsPage() {
           max_retries: maxRetries,
           run_at: runAt || undefined,
           idempotency_key: idempotencyKey || undefined,
-          depends_on_job_id: dependsOnId || undefined,
+          depends_on_job_ids: parentIds.length > 0 ? parentIds : undefined,
         }),
       });
       // Reset form
@@ -222,8 +227,8 @@ export default function JobsPage() {
                 <input className="input" value={idempotencyKey} onChange={(e) => setIdempotencyKey(e.target.value)} placeholder="unique-key" />
               </div>
               <div className="field" style={{ margin: 0 }}>
-                <label style={{ fontSize: 12, color: "var(--text-dim)" }}>Depends on job ID (optional)</label>
-                <input className="input" value={dependsOnId} onChange={(e) => setDependsOnId(e.target.value)} placeholder="uuid" style={{ fontFamily: "var(--font-mono)" }} />
+                <label style={{ fontSize: 12, color: "var(--text-dim)" }}>Prerequisites (comma-separated for DAG)</label>
+                <input className="input" value={dependsOnId} onChange={(e) => setDependsOnId(e.target.value)} placeholder="uuid-1, uuid-2" style={{ fontFamily: "var(--font-mono)" }} />
               </div>
             </div>
 
@@ -260,6 +265,11 @@ export default function JobsPage() {
                   <Link href={`/jobs/${j.id}`} style={{ color: "var(--signal-blue)" }}>
                     {j.name}
                   </Link>
+                  {((j.depends_on_job_ids && j.depends_on_job_ids.length > 0) || j.depends_on_job_id) && (
+                    <span className="badge queued" style={{ fontSize: 10, padding: "1px 5px", marginLeft: 6 }}>
+                      DAG ({j.depends_on_job_ids?.length || 1})
+                    </span>
+                  )}
                 </td>
                 <td><span className={`badge ${j.status}`}>{j.status}</span></td>
                 <td>{j.priority}</td>

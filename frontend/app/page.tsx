@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, DeadLetterJob, Project, Queue, Worker } from "../lib/api";
-import { useEvents } from "../lib/useEvents";
+import { useEvents, PulseEvent } from "../lib/useEvents";
 
 export default function DashboardPage() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -31,7 +31,7 @@ export default function DashboardPage() {
   }, [loadDashboardData]);
 
   // Instantly refresh dashboard on real-time SSE events
-  useEvents(useCallback((event) => {
+  useEvents(useCallback((event: PulseEvent) => {
     if (event.event.startsWith("job.") || event.event.startsWith("queue.")) {
       loadDashboardData();
     }

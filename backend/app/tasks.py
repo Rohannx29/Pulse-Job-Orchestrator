@@ -156,57 +156,17 @@ def _log(db, execution: JobExecution, level: LogLevel, message: str):
 
 
 def _release_dependents(db, completed_job: Job):
-    """A job finishing successfully may unblock others waiting on it."""
-    blocked = (
-        db.query(Job)
-        .filter(Job.depends_on_job_id == completed_job.id, Job.status == JobStatus.BLOCKED)
-        .all()
-    )
-    for dependent in blocked:
-        dispatch_job(dependent)
-        dep_org_id = get_job_org_id(db, dependent)
-        if dep_org_id:
-            publish_event(dep_org_id, "job.queued", {
-                "job_id": dependent.id,
-                "queue_id": dependent.queue_id,
-                "status": dependent.status.value,
-                "unblocked_by": completed_job.id,
-            })
-        logger.info("Dependency %s completed, releasing dependent job %s", completed_job.id, dependent.id)
-    if blocked:
-        db.commit()
+    """When a job finishes successfully, unblock downstream DAG dependents
+    whose full set of prerequisites have all finished."""
+    from app.dag import release_dag_dependents
+    return release_dag_dependents(db, completed_job, dispatcher=dispatch_job)
 
 
 def _cascade_fail_dependents(db, dead_job: Job, reason: str):
-    """A job that permanently failed (DLQ) can never satisfy jobs waiting
-    on it — recursively dead-letter its BLOCKED dependents too, rather
-    than leaving them blocked forever with no way to ever run."""
-    blocked = (
-        db.query(Job)
-        .filter(Job.depends_on_job_id == dead_job.id, Job.status == JobStatus.BLOCKED)
-        .all()
-    )
-    for dependent in blocked:
-        dependent.status = JobStatus.DEAD_LETTER
-        db.add(
-            DeadLetterJob(
-                job_id=dependent.id,
-                reason=f"Upstream dependency {dead_job.id} failed: {reason}",
-                original_payload=dependent.payload,
-                retry_count_at_failure=0,
-            )
-        )
-        dep_org_id = get_job_org_id(db, dependent)
-        if dep_org_id:
-            publish_event(dep_org_id, "job.dead_letter", {
-                "job_id": dependent.id,
-                "queue_id": dependent.queue_id,
-                "reason": f"Upstream dependency {dead_job.id} failed: {reason}",
-                "status": JobStatus.DEAD_LETTER.value,
-            })
-        logger.warning("Cascading DLQ from %s to blocked dependent %s", dead_job.id, dependent.id)
-        db.commit()
-        _cascade_fail_dependents(db, dependent, f"upstream dependency {dead_job.id} failed")
+    """When a job permanently fails (DLQ), recursively dead-letter all
+    downstream DAG dependents that rely on it."""
+    from app.dag import cascade_fail_dag_dependents
+    return cascade_fail_dag_dependents(db, dead_job, reason)
 
 
 @celery_app.task(bind=True, name="app.tasks.execute_job")
@@ -479,4 +439,36 @@ def prune_stale_data():
     finally:
         db.close()
         _redis.delete("pulse:lock:prune_stale_data")
+
+
+@celery_app.task(bind=True, name="app.tasks.deliver_webhook", max_retries=3)
+def deliver_webhook(self, delivery_id: str):
+    """Executes outbound webhook delivery for the given WebhookDelivery ID.
+    Performs retries with exponential backoff on transient errors (timeouts, 5xx)."""
+    from app.webhooks import execute_delivery
+
+    db = SessionLocal()
+    try:
+        success, status_code, error = execute_delivery(db, delivery_id)
+        if not success:
+            # Retry on network/DNS error (status_code is None) or 5xx server errors
+            # Do NOT retry on 4xx client errors or SSRF security blocks
+            is_ssrf = "SSRF validation blocked" in (error or "")
+            is_transient = (status_code is None and not is_ssrf) or (status_code is not None and status_code >= 500)
+            if is_transient and self.request.retries < self.max_retries:
+                # Exponential backoff: 5s, 25s, 125s
+                countdown = 5 * (5 ** self.request.retries)
+                logger.warning(
+                    "Webhook delivery %s failed (status=%s, err=%s). Retrying in %ss (attempt %d/%d)",
+                    delivery_id,
+                    status_code,
+                    error,
+                    countdown,
+                    self.request.retries + 1,
+                    self.max_retries,
+                )
+                raise self.retry(countdown=countdown)
+        return {"delivery_id": delivery_id, "success": success, "status_code": status_code, "error": error}
+    finally:
+        db.close()
 

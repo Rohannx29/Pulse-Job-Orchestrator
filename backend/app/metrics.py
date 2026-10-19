@@ -303,6 +303,22 @@ pulse_last_prune_timestamp_seconds = registry.register(
     Gauge("pulse_last_prune_timestamp_seconds", "UNIX timestamp of the most recent data retention prune run")
 )
 
+# Outbound Webhook Delivery Metrics
+pulse_webhook_deliveries_total = registry.register(
+    Counter(
+        "pulse_webhook_deliveries_total",
+        "Total outbound webhook delivery attempts partitioned by event and outcome status",
+        ["event", "status"],
+    )
+)
+pulse_webhook_delivery_duration_seconds = registry.register(
+    Histogram(
+        "pulse_webhook_delivery_duration_seconds",
+        "Outbound webhook delivery latency histogram in seconds",
+        ["event"],
+    )
+)
+
 
 # ---------- Metric Recording Helpers ----------
 

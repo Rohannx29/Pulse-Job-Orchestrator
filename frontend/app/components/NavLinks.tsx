@@ -14,6 +14,7 @@ const BASE_LINKS = [
   { href: "/schedules", label: "Schedules" },
   { href: "/workers", label: "Workers" },
   { href: "/dlq", label: "DLQ" },
+  { href: "/webhooks", label: "Webhooks" },
   { href: "/team", label: "Team" },
   { href: "/audit-logs", label: "Audit Logs" },
 ];

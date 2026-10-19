@@ -1,7 +1,25 @@
 import time
 import uuid
 
+import pytest
+import redis
+
+from app.config import settings
 from app.concurrency import acquire_queue_slot, current_usage, release_queue_slot
+
+
+def _is_redis_available() -> bool:
+    try:
+        r = redis.from_url(settings.REDIS_URL, socket_connect_timeout=1)
+        return bool(r.ping())
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_redis_available(),
+    reason="Redis server is not running or reachable; concurrency semaphore tests require live Redis",
+)
 
 
 def test_semaphore_respects_limit():

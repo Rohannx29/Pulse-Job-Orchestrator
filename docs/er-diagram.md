@@ -6,7 +6,7 @@ This document focuses on the important keys and relationships so the diagram rem
 
 ![Pulse entity-relationship diagram](diagrams/er-diagram.png)
 
-*17 entities across auth, tenancy, RBAC, audit logging, scheduling, and execution. The self-referential `Job.depends_on_job_id` relationship is omitted from the rendered image for visual clarity — see [Dependencies](#dependencies) below.*
+*20 entities across auth, tenancy, RBAC, audit logging, webhooks, scheduling, DAG workflows, and execution. The self-referential `Job.depends_on_job_id` relationship and `JobDependency` join table are omitted from the rendered image for visual clarity — see [DAG Dependencies](#directed-acyclic-graph-dag-dependencies) below.*
 
 ## How the model is organized
 
@@ -19,6 +19,7 @@ User ──── owns ────> Organization ──> Project ──> Queue
 
 Organization ── owns ──> InviteToken (single-use hashed token for employee onboarding)
 Organization ── owns ──> AuditLog (immutable trail of operator actions and mutations)
+Organization ── owns ──> WebhookSubscription (outbound push event configurations)
 ```
 
 Tenant-owned API resources follow this chain. Access is governed by the `OrganizationMember` authority table:
@@ -50,15 +51,33 @@ Job
 
 `Job` stores current state. `JobExecution` records attempts. `JobLog` records attempt-level messages. `DeadLetterJob` represents the job's current terminal DLQ state rather than a second execution history.
 
-### Dependencies
+### Directed Acyclic Graph (DAG) dependencies
 
-`Job.depends_on_job_id` is a nullable self-reference:
+Workflows support arbitrary Directed Acyclic Graphs (DAGs) with multi-parent fan-in (`A, B → C`), multi-child fan-out (`C → D, E`), and diamond topologies (`A → B, C → D`).
 
 ```text
-Job A → Job B → Job C
+       ┌───────────┐
+       │   Job A   │
+       └─────┬─────┘
+             │ (Fan-Out)
+       ┌─────┴─────┐
+       ▼           ▼
+  ┌─────────┐ ┌─────────┐
+  │  Job B  │ │  Job C  │
+  └────┬────┘ └────┬────┘
+       │ (Fan-In)  │
+       └─────┬─────┘
+             ▼
+       ┌───────────┐
+       │   Job D   │ (Waits for BOTH B & C)
+       └───────────┘
 ```
 
-The current API creates a dependency against an already-existing job. The implemented scope supports **one dependency per job**, not arbitrary DAG/fan-in workflows.
+Dependencies are normalized via the `JobDependency` (`job_dependencies`) join table:
+- **Composite Primary Key**: `(parent_job_id, child_job_id)` enforces edge uniqueness.
+- **Foreign Key Cascades**: Both `parent_job_id` and `child_job_id` reference `jobs.id` with `ON DELETE CASCADE`.
+- **Topological Integrity**: In-memory Depth-First Search (`detect_cycle_dfs`) guarantees acyclic topology before dependency rows are committed.
+- **Backward Compatibility**: Single-parent `Job.depends_on_job_id` is preserved as an auto-synchronized convenience pointer.
 
 ### Retry policies
 
@@ -67,6 +86,17 @@ A Queue can own multiple retry policies and a Job can optionally reference one t
 ### Workers
 
 Workers are shared execution infrastructure. A worker can execute many attempts, report heartbeats, and temporarily appear as the current claimant of jobs. Historical execution records remain if a worker is removed; worker foreign keys use `SET NULL` where appropriate.
+
+### Webhooks and delivery history
+
+```text
+Organization ── owns ──> WebhookSubscription × N
+                             │
+                             └── owns ──> WebhookDelivery × N
+```
+
+- **`WebhookSubscription`**: Scoped to an `organization_id`. Stores the destination `url`, cryptographic HMAC signing `secret` (`whsec_...`), subscribed `events` array (e.g. `["*"]` or `["job.completed", "job.failed"]`), `is_active` boolean, and optional description.
+- **`WebhookDelivery`**: Audit log of each outbound dispatch attempt linked to `subscription_id` with `event`, request `payload`, HTTP `status_code`, truncated `response_body` (capped at 2KB), `error_message`, execution `duration_ms`, `attempt_number`, and `is_success`. Cascades on subscription deletion.
 
 ## Important constraints
 
@@ -81,6 +111,14 @@ Workers are shared execution infrastructure. A worker can execute many attempts,
 - Job submission idempotency is scoped by `(queue_id, idempotency_key)`.
 - `(queue_id, status)` is indexed for queue/job filtering.
 - Celery task IDs and other operational lookup fields are indexed.
+- `webhook_subscriptions.org_id` is foreign-keyed to `organizations.id` with `CASCADE`.
+- `webhook_deliveries.subscription_id` is foreign-keyed to `webhook_subscriptions.id` with `CASCADE`.
+- `(webhook_deliveries.subscription_id, delivered_at)` is indexed for fast delivery history queries.
+- `(parent_job_id, child_job_id)` is the composite primary key in `job_dependencies`.
+- `job_dependencies.parent_job_id` and `job_dependencies.child_job_id` are foreign-keyed to `jobs.id` with `CASCADE`.
+- `job_dependencies.child_job_id` and `job_dependencies.parent_job_id` are individually indexed for fast prerequisite resolution and recursive cascading failure traversal.
+
+---
 
 
 ## Updating the diagram

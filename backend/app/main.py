@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.logging_config import CorrelationIdMiddleware, setup_logging
-from app.routers import admin, audit, auth, dlq, events, health, jobs, orgs, projects, queues, schedules, workers
+from app.routers import admin, audit, auth, dlq, events, health, jobs, orgs, projects, queues, schedules, webhooks, workers
 
 # Initialize structured JSON logging
 if settings.LOG_FORMAT == "json":
@@ -36,4 +36,5 @@ app.include_router(jobs.router)
 app.include_router(schedules.router)
 app.include_router(workers.router)
 app.include_router(dlq.router)
+app.include_router(webhooks.router)
 

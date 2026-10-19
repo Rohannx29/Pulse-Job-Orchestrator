@@ -42,6 +42,10 @@
 32. [Prometheus metrics exposition and deep component healthchecks](#32-prometheus-metrics-exposition-and-deep-component-healthchecks)
 33. [Multi-stage container builds and non-root process security](#33-multi-stage-container-builds-and-non-root-process-security)
 34. [Batch data retention policies and table pruning](#34-batch-data-retention-policies-and-table-pruning)
+35. [Outbound webhook delivery engine with cryptographic HMAC signatures and SSRF defense](#35-outbound-webhook-delivery-engine-with-cryptographic-hmac-signatures-and-ssrf-defense)
+36. [Multi-parent directed acyclic graph (DAG) workflows and cycle detection](#36-multi-parent-directed-acyclic-graph-dag-workflows-and-cycle-detection)
+37. [Automated multi-stage CI/CD with matrix testing and multi-architecture container builds](#37-automated-multi-stage-cicd-with-matrix-testing-and-multi-architecture-container-builds)
+38. [End-to-end browser testing with Playwright and synthetic operator journeys](#38-end-to-end-browser-testing-with-playwright-and-synthetic-operator-journeys)
 
 ---
 
@@ -589,17 +593,9 @@ A true dependency cycle is structurally prevented because:
 
 Therefore dependency edges point backward in creation time.
 
-### Current limitation
+### Evolution & Resolution: Multi-Parent DAG Workflows
 
-The model supports **one dependency**, not multiple dependencies such as:
-
-```text
-A ─┐
-   ├→ C
-B ─┘
-```
-
-Supporting fan-in would require a dependency/join table and a "has every dependency completed?" check.
+*(Historical limitation resolved in Decision #36)*: Multi-parent fan-in (`A, B → C`), arbitrary fan-out, and diamond dependencies are now fully supported via the `job_dependencies` join table and the DAG orchestration engine (`app/dag.py`), preserving backwards compatibility with `Job.depends_on_job_id`. See [Decision #36: Multi-Parent Directed Acyclic Graph (DAG) Workflows and Cycle Detection](#36-multi-parent-directed-acyclic-graph-dag-workflows-and-cycle-detection).
 
 ---
 
@@ -1471,6 +1467,124 @@ High-throughput distributed schedulers generate millions of operational rows (he
 
 ---
 
+## 35. Outbound webhook delivery engine with cryptographic HMAC signatures and SSRF defense
+
+### Decision
+
+Pulse provides an enterprise outbound webhook delivery system allowing organizations to subscribe to platform lifecycle events (`job.created`, `job.completed`, `job.failed`, `job.dead_letter`, `job.retried`, and wildcard `*`). Deliveries are signed using HMAC-SHA256 (`whsec_...`), protected by strict pre-flight SSRF validation (`validate_public_url`), dispatched via background tasks on `pulse.internal` with exponential backoff retries, and persistently tracked in PostgreSQL (`webhook_deliveries`).
+
+### Why
+
+1. **Push vs. Polling Efficiency**: High-throughput distributed workflow platforms cannot require customers to continuously poll `/jobs/{id}` for completion status. Outbound webhooks push status transitions immediately as they occur, eliminating network round-trip overhead and unnecessary database read queries.
+2. **Cryptographic Authenticity & Non-Repudiation**: External webhook consumers must verify that an incoming HTTP POST genuinely originated from Pulse and has not been forged or tampered with by a malicious intermediary.
+3. **Replay Attack Mitigation**: Attackers intercepting valid signed webhooks could re-post the payload to trigger duplicate downstream business workflows. Including an epoch timestamp in the signed payload and rejecting requests outside a 300-second window mitigates replay risks.
+4. **Server-Side Request Forgery (SSRF) Protection**: Allowing users to configure custom destination URLs introduces high-severity SSRF vulnerabilities: attackers can point webhooks to cloud instance metadata (`169.254.169.254`), loopback administration interfaces (`http://127.0.0.1:8000/admin`), or internal database VPC endpoints.
+5. **Capacity & Resource Isolation**: Outbound requests to customer servers are subject to unpredictable latency, slow network connections, server crashes, and prolonged 5xx outages. Webhook delivery must never run on customer job worker pools (`pulse.high`, `pulse.normal`, `pulse.low`) where slow external servers could exhaust execution concurrency.
+
+### Design and Guarantees
+
+1. **Cryptographic Secret Generation (`app/webhooks.py`)**:
+   Each subscription is provisioned with a dedicated signing secret prefixed with `whsec_` containing 48 hex characters (24 cryptographically random bytes via `secrets.token_hex(24)`).
+2. **Canonical Signature Format**:
+   Payloads are signed across an envelope containing the timestamp and compact JSON payload:
+   ```python
+   signature = "v1=" + hmac.new(secret.encode(), f"{timestamp}.{raw_payload}".encode(), hashlib.sha256).hexdigest()
+   ```
+   Headers include `X-Pulse-Signature: v1=...`, `X-Pulse-Timestamp: ...`, `X-Pulse-Event: ...`, and `X-Pulse-Delivery-ID: ...`.
+3. **Mandatory SSRF Pre-Flight Verification**:
+   Before establishing socket connections, `validate_public_url(url)` resolves the target hostname and blocks loopback, link-local, multicast, RFC 1918 private subnets, and non-HTTP(S) schemes. Blocked attempts fail immediately without retry.
+4. **Segregated Execution on `pulse.internal`**:
+   The `deliver_webhook` task executes strictly on the management queue. Celery retries are configured with exponential backoff (`5s * 5^retries`: 5s, 25s, 125s) for transient failures (HTTP 5xx, socket timeouts), while deterministic 4xx errors and SSRF blocks do not retry.
+5. **Delivery History & Telemetry**:
+   Every delivery attempt records HTTP response status code, truncated response body (capped at 2KB), network duration in milliseconds, attempt count, and error strings in `webhook_deliveries`, with real-time exposition in Prometheus (`pulse_webhook_deliveries_total`, `pulse_webhook_delivery_duration_seconds`).
+
+---
+
+## 36. Multi-parent directed acyclic graph (DAG) workflows and cycle detection
+
+### Decision
+
+Pulse provides enterprise Directed Acyclic Graph (DAG) orchestration supporting arbitrary dependency topologies with multi-parent fan-in (synchronization barriers), multi-child fan-out (parallel branching), diamond workflows, in-memory Depth-First Search (DFS) topological cycle detection, non-blocking join resolution, recursive cascading failure, and backward compatibility with single-parent dependencies.
+
+### Why
+
+1. **Complex Real-World Pipelines**: Modern distributed workloads are rarely simple linear chains (`A → B → C`). Real-world ETL, ML training, and deployment pipelines require fan-out (spawning parallel data extraction or shard processing jobs) followed by fan-in (aggregating shard outputs into a single report or model artifact).
+2. **Deadlock Prevention via Pre-Commit Cycle Detection**: Circular dependencies (`A → B → C → A`) in a distributed scheduler cause permanent deadlocks where tasks remain `BLOCKED` indefinitely, waiting on each other with no worker ever able to execute them. Cycle detection must be evaluated before committing dependencies and return deterministic HTTP 400 Bad Request diagnostics.
+3. **Synchronization Barrier Correctness**: A child with multiple parents must only dispatch when *all* prerequisites have reached terminal `COMPLETED` status. Dispatching prematurely when only one parent completes violates data dependencies and leads to corrupt or missing inputs.
+4. **Cascading Failure Provenance**: If an upstream parent task permanently fails (`DEAD_LETTER`), waiting children can never satisfy their prerequisite requirements. Leaving downstream tasks `BLOCKED` indefinitely wastes resources and obscures root-cause diagnostics. Cascading failure must transition downstream tasks to `DEAD_LETTER` with explicit provenance recording which upstream parent failed.
+5. **Zero-Downtime Backward Compatibility**: Existing jobs and client code using the legacy `Job.depends_on_job_id` attribute must continue to function without modification while seamlessly utilizing the new join table under the hood.
+
+### Design and Guarantees
+
+1. **Normalized Join Table (`job_dependencies`)**:
+   Dependencies are decoupled from the `jobs` table into a dedicated `job_dependencies` join table with a composite primary key `(parent_job_id, child_job_id)`, indexed foreign keys, and cascading delete constraints. Alembic migration `e4f5a6b7c8d9` automatically backfilled all existing `depends_on_job_id` foreign keys into `job_dependencies`.
+2. **Topological Cycle Detection via DFS (`app/dag.py`)**:
+   Before creating or updating dependency edges, `detect_cycle_dfs` performs a depth-first traversal of downstream reachable nodes. If any proposed parent is reachable from the child, adding the edge would create a directed loop. Self-loops (`A → A`), direct cycles (`A → B → A`), and transitive multi-hop cycles (`A → B → C → D → A`) are rejected immediately with HTTP 400 Bad Request, formatting the exact directed cycle path for debugging.
+3. **Non-Blocking Join Resolution**:
+   When a parent job completes, `release_dag_dependents` queries all direct child jobs. For each child, it evaluates the status of all prerequisite parents. If and only if every parent has reached `COMPLETED`, the child transitions from `BLOCKED` to `QUEUED` and is dispatched to Celery via `dispatch_job()`.
+4. **Recursive Cascading Failure**:
+   When a job permanently exhausts retries and transitions to `DEAD_LETTER`, `cascade_fail_dag_dependents` recursively traverses all direct and transitive downstream dependents in `BLOCKED` state, transitioning them to `DEAD_LETTER` with `DeadLetterJob.reason="Cascaded failure: prerequisite parent job {id} permanently failed"`.
+5. **API and Frontend Observability**:
+   The API exposes `GET /jobs/{id}/dag` and `GET /projects/{id}/dag` returning DAG nodes and directed edges. The Next.js UI (`/jobs/[id]`) renders an interactive directed graph visualization alongside a real-time prerequisite checklist displaying completion percentages and status badges.
+
+---
+
+## 37. Automated multi-stage CI/CD with matrix testing and multi-architecture container builds
+
+### Decision
+
+Pulse uses a multi-job GitHub Actions workflow (`.github/workflows/ci.yml`) featuring ephemeral PostgreSQL 16 and Redis 7 service containers, Ruff static analysis, strict TypeScript validation, Next.js standalone artifact generation, end-to-end Docker Compose smoke testing, and QEMU/Buildx multi-architecture container compilation (`linux/amd64`, `linux/arm64`) published to GitHub Container Registry (GHCR).
+
+### Why
+
+1. **Service Container Realism**: Unit tests using purely in-memory mocks fail to catch database-specific dialect constraints, transaction isolation quirks, or Redis Lua script concurrency bugs. Running CI against true PostgreSQL 16 and Redis 7 service containers with healthchecks guarantees that verified behavior matches production environments.
+2. **Shift-Left Quality Gates**: Catching syntax errors, unused imports, type mismatch regressions (such as implicit `any` in TypeScript), and database migration errors during pull requests prevents defects from polluting deployment branches or breaking production builds.
+3. **Migration Verification on Fresh Storage**: Running `alembic upgrade head` from a blank database ensures that all database migrations chain together without missing revisions, circular dependencies, or unsupported PostgreSQL enum mutations.
+4. **Multi-Architecture Hardware Support**: Production cloud environments increasingly deploy on ARM64 architectures (e.g. AWS Graviton, GCP Tau T2A) for superior cost-performance efficiency, while development machines vary across AMD64 and ARM64 (Apple Silicon). Compiling multi-architecture container images via Docker Buildx and QEMU ensures seamless deployments across any cloud infrastructure.
+5. **Docker Compose Smoke Verification**: A unit test passing does not prove that multi-container orchestration starts correctly. The pipeline brings up all 9 containers via `docker compose up -d --build` and verifies that `/health` readiness probes, `/health/live` liveness probes, and the Next.js UI return HTTP 200 before tagging or releasing images.
+
+### Design and Guarantees
+
+1. **Strict Quality Gates**:
+   - Backend: Ruff static analysis (`ruff check --select E,F,W --ignore E501 backend`) verifies clean code syntax without stylistic noise.
+   - Frontend: Strict TypeScript compilation (`npx tsc --noEmit`) and Next.js standalone bundling (`npm run build`).
+2. **Ephemeral Service Containers**:
+   PostgreSQL 16 and Redis 7 start with `--health-cmd` checks, ensuring that tests and migrations never race database initialization.
+3. **End-to-End Test Suite Execution**:
+   Pytest runs all 75 integration and unit tests across priority queues, DLQ state machines, concurrency semaphores, rate limiting, and webhooks with XML coverage artifact generation.
+4. **Layered GHA Build Caching (`type=gha`)**:
+   Docker Buildx caches intermediate build layers within GitHub Actions cache, reducing multi-architecture build times from minutes to seconds on subsequent commits.
+
+---
+
+## 38. End-to-end browser testing with Playwright and synthetic operator journeys
+
+### Decision
+
+Pulse uses **Playwright** (`frontend/e2e/`) to execute automated headless browser tests against the compiled Next.js operator console and FastAPI backend, simulating real user journeys across isolated tenant contexts.
+
+### Why
+
+1. **True Browser Environment Fidelity**: API unit tests verify HTTP JSON payloads, and component tests verify isolated React trees, but neither validates real browser behavior: cookie transmission across CORS boundaries, Next.js edge middleware redirects, client-side routing, DOM updates, form validation, and SVG canvas rendering.
+2. **Preventing Broken Front-of-House User Journeys**: Subtle regressions—such as broken redirect query parameters (`/login?next=/jobs`), missing CSS layout wrappers, unhandled promise rejections, or TypeScript type inference bugs (like the implicit `any` parameter caught in `page.tsx`)—can prevent users from operating the system even when backend tests are 100% green.
+3. **Session & Security Validation in Real Contexts**: Verifying that `pulse_access_token` httpOnly cookies are stored, correctly transmitted on subsequent fetch calls, properly protected by edge middleware, and cleanly revoked upon clicking "Sign out" provides end-to-end assurance that authentication security holds in live browsers.
+4. **Interactive Feature Validation**: Critical distributed capabilities—such as dynamically pausing/resuming queues, rendering multi-parent DAG dependency hierarchies, revealing masked HMAC webhook secrets (`whsec_...`), and inspecting audit logs—require end-to-end interactive validation.
+
+### Design and Guarantees
+
+1. **Synthetic Tenant Isolation (`frontend/e2e/helpers.ts`)**:
+   Every test runs within a newly registered tenant organization, ensuring complete state isolation without shared test data pollution or cascading test dependencies.
+2. **Deterministic Playwright Architecture (`playwright.config.ts`)**:
+   Playwright automatically manages the Next.js production web server (`npm run start`), captures trace dumps on first retry, and records screenshots on failure for post-mortem debugging.
+3. **Core Journey Coverage (`frontend/e2e/`)**:
+   - `auth.spec.ts`: Route protection guards, credential error handling, registration, login, and logout.
+   - `queues.spec.ts`: Project navigation, queue creation, and dynamic pause/resume toggles.
+   - `jobs-dag.spec.ts`: Multi-parent job submission, prerequisite checklist rendering, and DAG topology diagram inspection.
+   - `webhooks.spec.ts`: Endpoint registration, HMAC secret masking/revealing, test ping execution, and delivery audit drawer expansion.
+   - `audit-logs.spec.ts`: Administrative activity trail rendering, actor attribution, and dropdown action filtering.
+
+---
+
 ## Decision summary
 
 | Area | Chosen approach | Main reason |
@@ -1484,7 +1598,8 @@ High-throughput distributed schedulers generate millions of operational rows (he
 | Priority | Dedicated Celery queues/workers | Real capacity isolation |
 | Internal tasks | `pulse.internal` | Protect scheduler control-plane work |
 | Scheduling | Beat + croniter | Reuse normal job pipeline |
-| Dependencies | Self-referential FK + `BLOCKED` | Useful sequencing without a DAG engine |
+| Legacy dependencies | Self-referential FK + `BLOCKED` | Backwards-compatible single-parent sequencing |
+| Arbitrary DAG workflows | Many-to-many `job_dependencies` + DFS cycle detection + fan-in resolution | Complex multi-stage pipelines with diamond dependencies and cascading failure |
 | Idempotency | `(queue_id, idempotency_key)` | Correct submission scope |
 | Worker tracking | PostgreSQL worker registry | Persistent execution ownership |
 | Auth | Cookie + rotating refresh tokens | Reduced token exposure + reuse detection |
@@ -1498,6 +1613,9 @@ High-throughput distributed schedulers generate millions of operational rows (he
 | Metrics & deep healthchecks | Prometheus format 0.0.4 (`/metrics`) + decoupled readiness/liveness (`/health`, `/health/live`) | Cluster telemetry, queue depth alerting, and cascade-proof orchestrator lifecycle management |
 | Container security & multi-stage | Builder/runtime separation + non-root UID 10001/1001 + `no-new-privileges` | Eliminates compilers from runtime, reduces image size, and prevents root escalation |
 | Data retention & pruning | Chunked batch deletes + `pulse.internal` + Redis lock + audit trail | Eliminates table bloat and WAL spikes without blocking concurrent workloads |
+| Outbound webhooks & signatures | HMAC-SHA256 (`whsec_...`) + SSRF validation + `pulse.internal` + delivery auditing | Cryptographic authenticity, replay prevention, and control-plane isolation |
+| CI/CD & multi-arch delivery | GitHub Actions + ephemeral services + Buildx QEMU | Automated verification across PostgreSQL 16 & Redis 7 with AMD64/ARM64 container images |
+| End-to-end browser testing | Playwright + isolated browser contexts + Next.js webServer | Real browser verification of auth cookies, queue controls, DAG graphs, and webhooks |
 
 ---
 

@@ -29,10 +29,26 @@ else:
             self.conf = self._Conf()
             self.control = _DummyControl()
         def task(self, *args, **kwargs):
+            bind = kwargs.get("bind", False)
+            max_retries = kwargs.get("max_retries", 3)
             def decorator(fn):
-                fn.apply_async = lambda *a, **k: None
-                fn.delay = lambda *a, **k: None
-                return fn
+                class TaskWrapper:
+                    def __init__(self, target_fn):
+                        self.target_fn = target_fn
+                        self.max_retries = max_retries
+                        self.request = type("Req", (), {"retries": 0})()
+                    def __call__(self, *a, **k):
+                        if bind:
+                            return self.target_fn(self, *a, **k)
+                        return self.target_fn(*a, **k)
+                    def apply_async(self, *a, **k):
+                        return None
+                    def delay(self, *a, **k):
+                        return None
+                    def retry(self, *a, **k):
+                        raise RuntimeError(f"Retry triggered: {k}")
+                wrapper = TaskWrapper(fn)
+                return wrapper
             return decorator
     celery_app = _DummyCelery()
 
