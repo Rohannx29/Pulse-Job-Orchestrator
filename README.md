@@ -383,48 +383,70 @@ python -m pytest tests/test_cookie_auth_integration.py -v
 
 Integration tests require the dependencies specified by the project and, where applicable, real PostgreSQL/Redis services. A test that cannot collect because dependencies are absent is an environment/setup failure, not evidence that the application logic passed.
 
-## Security model
+## Environment support matrix
 
-Pulse currently provides:
+Pulse supports distinct deployment profiles tailored for local evaluation, continuous integration, pre-production staging, and production:
 
-- password hashing (Argon2 / bcrypt)
-- httpOnly cookie-based access/refresh authentication (query-string JWT rejected across all APIs)
-- short-lived, single-use SSE connection tickets (`POST /auth/sse-ticket`) with atomic consumption
-- refresh-token hashing at rest and family-based reuse detection
-- role-based access control (System Admin, Org Admin, Member)
-- single-use, hashed invite tokens for team onboarding
-- explicit CORS origin and same-origin `/api` Next.js reverse proxy configuration
-- Cross-Site Request Forgery (CSRF) protection middleware on state-modifying requests bearing cookies
-- trusted proxy client IP extraction preventing `X-Forwarded-For` header spoofing
-- fail-closed sliding-window rate limiting on sensitive endpoints (`/auth/login`, `/auth/register`) during Redis outages
-- defense-in-depth SSRF HTTP client (IPv4/IPv6 address validation, cloud metadata blocking, disabled redirects, bounded timeouts and capped 1MB payloads)
-- KMS secret encryption at rest (Fernet AES-128) for outbound webhook secrets with non-destructive rotation grace windows
-- automatic delivery log sanitization and credential redaction
-- organization-scoped resource authorization with 404 responses for cross-tenant access
-- private `/metrics` protection via private network restriction and Bearer tokens
+| Capability / Tier | Local Demo (`docker-compose.yml`) | CI Pipeline (GitHub Actions) | Staging (`docker-compose.prod.yml`) | Scaled Production |
+|---|---|---|---|---|
+| **Intended Purpose** | Local developer testing & rapid feedback | Automated linting, test suites & container builds | Pre-production validation & performance testing | Highly available tenant workload orchestration |
+| **Database** | PostgreSQL 16 (single container, exposed port) | PostgreSQL 16 (ephemeral service container) | PostgreSQL 16 (segmented network, no host port) | Managed PostgreSQL (RDS/Cloud SQL) with read replicas |
+| **Cache & Broker** | Redis 7 (single container, unauthenticated) | Redis 7 (ephemeral service container) | Redis 7 (`requirepass`, AOF enabled, no host port) | Managed Redis cluster with TLS & password authentication |
+| **Worker Pools** | Combined or concurrency-capped local workers | Ephemeral Celery test runners | Dedicated pools (`internal`, `high`, `normal`, `low`) | Autoscaling Kubernetes worker deployments per queue |
+| **Authentication** | httpOnly cookies (`IS_DEV=true`) | Ephemeral test secret keys | httpOnly cookies + strict secure flag | Same-origin or custom domain with validated CORS & CSRF |
+| **Perimeter & TLS** | Plain HTTP (`localhost:8000`, `:3000`) | Headless HTTP test server | Local reverse proxy TLS (Nginx / Caddy) | Cloud Load Balancer / API Gateway with WAF & TLS termination |
+| **Database Backups** | Local Docker volume persistence | N/A (ephemeral) | Automated daily `pg_dump` with 14-day retention | Automated cloud snapshots with point-in-time recovery |
 
-The HTTP handler is hardened against common private/loopback/link-local targets, but DNS rebinding is a deeper network-level problem. Production deployment should add egress controls or a dedicated proxy.
+## Operational & execution semantics
 
-## Execution semantics
+### 1. Job execution and retry semantics
+- **At-Least-Once Delivery**: Pulse uses at-least-once execution semantics. Celery late task acknowledgement (`task_acks_late=True`) ensures that if a worker crashes midway through execution, the task remains on the broker and is redelivered.
+- **Submission Idempotency vs Side-Effects**: `(queue_id, idempotency_key)` uniqueness guarantees that repeated submissions of the same job return the existing record without duplicate queuing. However, downstream task handlers performing non-idempotent mutations (e.g. charging a payment gateway) must implement domain-level idempotency tokens.
+- **Retry & DLQ State Machine**: Jobs fail with structured backoff (`fixed`, `linear`, `exponential`). When `current_retry_count >= max_retries`, the job transitions to `FAILED` or `DEAD_LETTER`, persisting execution history and failure logs for operator inspection.
 
-Pulse uses **at-least-once execution semantics**.
+### 2. Scheduler catch-up policy
+- **Bounded Catch-Up**: Recurring schedules are evaluated by Celery Beat every 30 seconds via `croniter`.
+- **Occurrence Uniqueness**: Every fire tick is durably recorded in `schedule_occurrences` keyed by `(schedule_id, scheduled_fire_time)` before the job is queued.
+- **Downtime Catch-Up Policy**: If the scheduler is stopped or delayed, Beat evaluates only the current window; Pulse intentionally does *not* flood the system with hundreds of backlogged historical jobs upon restart.
+- **Fail-Closed Malformed Cron**: If an invalid cron syntax is encountered in legacy data, the schedule is automatically disabled (`is_active=False`), marked invalid, and audited (`schedule.invalid_disabled`), allowing other healthy schedules to continue uninterrupted.
 
-With late task acknowledgement, a worker crash can cause Celery to redeliver a task. If an external side effect occurred before the crash, that side effect may happen again.
+### 3. Transactional outbox delivery semantics
+- **Atomic Database Persistence**: Every state transition that causes an external side effect (Celery job dispatch, real-time SSE broadcasts, or outbound webhooks) is written to `outbox_events` in the *same* database transaction as the aggregate change.
+- **Row-Locked Polling Publisher**: A periodic Celery worker claims pending outbox rows using `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL, guaranteeing concurrent publishers never double-claim or race.
+- **Worker Crash Recovery**: If a publisher crashes after dispatching to Celery but before updating the outbox row, the task is safely redelivered under at-least-once semantics with retry counts bounded to 5 attempts.
 
-Therefore:
+### 4. Data retention & table pruning
+- **Automated Celery Beat Pruning**: Running on `pulse.internal`, the retention engine runs hourly batch deletions:
+  - Job logs & execution history: purged after 30 days.
+  - Completed jobs: purged after 60 days.
+  - Worker heartbeats: purged after 7 days.
+  - Immutable audit logs: retained for 365 days.
+- **Chunked Batch Deletions**: Deletes are executed in bounded batches (1,000 rows/batch) to avoid database lock contention and transaction log bloat.
 
-> `idempotency_key` makes **job submission** idempotent; it does not make arbitrary external side effects exactly-once.
+### 5. Webhook secret lifecycle & KMS encryption
+- **Secret Generation & Storage**: Webhook secrets are generated with high entropy (`whsec_...`) and encrypted at rest in PostgreSQL via Fernet AES-128 (`enc:v1:...`).
+- **Single Raw Secret Exposure**: The raw secret is returned in plaintext *exactly once* upon creation or rotation (`WebhookSubscriptionCreateOut`). All subsequent GET and LIST endpoints mask or omit the secret.
+- **Dual-Signing Rotation Grace Window**: Non-destructive rotation creates a new active secret while preserving the previous secret and stamping `previous_secret_expires_at` (default 24 hours). Inbound delivery verification accepts signatures signed by either key until the window expires.
+- **Org-Admin Access Boundary**: Creation, modification, deletion, secret rotation, and delivery log inspection are restricted to the `org_admin` or `system_admin` role. Regular members receive `403 Forbidden`.
 
-## Current limitations
+### 6. Production deployment topology
+- **Segmented Networks**: `pulse-internal` (internal: true) isolates PostgreSQL, Redis, and workers with zero exposed host ports. `pulse-ingress` exposes only API and UI behind audited reverse proxies.
+- **One-Off Migration Gate**: `docker-compose.prod.yml` runs a dedicated `migration` container executing `alembic upgrade head`; API and workers depend on its successful completion before booting.
+- **Least Privilege**: Containers execute as non-root users (`10001:10001` for backend, `1001:1001` for frontend) with `no-new-privileges:true`.
 
-The following are intentionally outside the current implementation scope:
+## Threat model & accepted risks
 
-- Dedicated egress proxy / network firewall for hardware-level DNS rebinding defense
-- Active lease heartbeat renewal for jobs exceeding 30-minute durations
-- Cloud KMS / HSM-backed hardware keystore (currently software Fernet AES-128 master key)
-- Distributed OpenTelemetry tracing collector export (currently structured single-line JSON logs with correlation IDs)
+| Threat Vector | Mitigation Strategy | Remaining Accepted Risk / Production Recommendation |
+|---|---|---|
+| **Server-Side Request Forgery (SSRF)** | Integrated HTTP transport validating all resolved IPv4/IPv6 addresses, blocking RFC1918, loopback, link-local, and cloud metadata (`169.254.169.254`). Redirects strictly disabled (`follow_redirects=False`). Payload capped at 1MB. | Dedicated egress proxy or firewall recommended in enterprise clouds to defend against low-level hardware DNS rebinding. |
+| **Token Theft & Credential Leakage** | Query-string JWT authentication completely removed. Enforced httpOnly access/refresh cookies with rotating tokens. Single-use 60s SSE connection tickets. | In cross-origin deployments without reverse proxying, secure cookie domain and CORS settings must be strictly configured. |
+| **Rate-Limiter Spoofing & DoS** | Client IP extracted from `X-Forwarded-For` *only* when the direct socket connection matches `TRUSTED_PROXIES`. Sensitive auth routes fail closed (`503`) during Redis outages. 256KB payload caps and 100-job batch limits protect DB memory. | Trusted proxy list must be updated if cloud load balancer IP ranges change. |
+| **Cross-Site Request Forgery (CSRF)** | `CSRFProtectionMiddleware` verifies `Origin` and `Referer` headers against `CORS_ORIGINS` for all state-modifying requests bearing cookies. | Custom client applications communicating via raw curl/Postman without cookies are unaffected. |
+| **Cryptographic Key Compromise** | Webhook secrets encrypted at rest with Fernet AES-128. Single raw secret exposure on write. Redacted delivery logs. | Production deployments with strict compliance requirements should integrate hardware-backed keys (AWS KMS / GCP Cloud KMS). |
+| **Database Schema Reversibility** | Explicit foreign key constraint naming and dialect-guarded DDL verified via automated `upgrade -> downgrade -> upgrade` CI tests. | Irreversible destructive schema changes (e.g. dropping data columns) must be deployed via multi-phase expand/contract patterns. |
 
 ## Documentation
+
 
 The submission documentation is intentionally small:
 
