@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from app.dispatch import dispatch_job
 from app.events import get_job_org_id, publish_event
 from app.models import DeadLetterJob, Job, JobDependency, JobStatus, Queue
+from app.outbox import record_event_outbox
 
 logger = logging.getLogger(__name__)
 
@@ -226,19 +227,14 @@ def release_dag_dependents(db: Session, completed_job: Job, dispatcher=None) -> 
             )
 
             if updated_count == 1:
-                # Winner! Dispatch child job
+                # Winner! Dispatch child job through caller-owned session
                 run_dispatch = dispatcher if dispatcher is not None else dispatch_job
-                run_dispatch(child)
+                try:
+                    run_dispatch(child, db=db)
+                except TypeError:
+                    run_dispatch(child)
                 unblocked_jobs.append(child)
 
-                dep_org_id = get_job_org_id(db, child)
-                if dep_org_id:
-                    publish_event(dep_org_id, "job.queued", {
-                        "job_id": child.id,
-                        "queue_id": child.queue_id,
-                        "status": JobStatus.QUEUED.value,
-                        "unblocked_by": completed_job.id,
-                    })
                 logger.info(
                     "All %d prerequisites completed. Unblocked dependent job %s (atomic winner)",
                     len(required_parent_ids),
@@ -305,7 +301,7 @@ def cascade_fail_dag_dependents(db: Session, dead_job: Job, reason: str) -> List
 
         dep_org_id = get_job_org_id(db, child)
         if dep_org_id:
-            publish_event(dep_org_id, "job.dead_letter", {
+            record_event_outbox(db, dep_org_id, "job.dead_letter", {
                 "job_id": child.id,
                 "queue_id": child.queue_id,
                 "reason": cascade_reason,

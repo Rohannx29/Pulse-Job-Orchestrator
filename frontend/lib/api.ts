@@ -1,7 +1,28 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export function getApiBaseUrl(): string {
+  if (typeof window !== "undefined") {
+    // In browser: use relative /api path if NEXT_PUBLIC_API_URL is not explicitly configured
+    return process.env.NEXT_PUBLIC_API_URL || "/api";
+  }
+  // Server-side (SSR / Node.js)
+  return process.env.INTERNAL_API_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+}
+
+export function buildApiUrl(path: string): string {
+  const base = getApiBaseUrl();
+  const cleanBase = base.endsWith("/") ? base.slice(0, -1) : base;
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+
+  // Prevent double /api prefix if both base and path contain it
+  if (cleanBase.endsWith("/api") && cleanPath.startsWith("/api/")) {
+    return `${cleanBase}${cleanPath.slice(4)}`;
+  }
+  return `${cleanBase}${cleanPath}`;
+}
+
+export const API_URL = getApiBaseUrl();
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, {
+  const res = await fetch(buildApiUrl(path), {
     ...options,
     credentials: "include",
     headers: {
@@ -25,7 +46,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 }
 
 export async function login(email: string, password: string): Promise<void> {
-  const res = await fetch(`${API_URL}/auth/login`, {
+  const res = await fetch(buildApiUrl("/auth/login"), {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -43,7 +64,7 @@ export async function register(
   fullName: string,
   organizationName: string
 ): Promise<void> {
-  const res = await fetch(`${API_URL}/auth/register`, {
+  const res = await fetch(buildApiUrl("/auth/register"), {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },

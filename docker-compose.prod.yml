@@ -108,7 +108,7 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"]
     networks:
       - pulse-internal
       - pulse-ingress
@@ -309,7 +309,8 @@ services:
       NODE_ENV: production
       PORT: "3000"
       NEXT_TELEMETRY_DISABLED: "1"
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL must be set}
+      INTERNAL_API_URL: "http://api:8000"
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
     depends_on:
       api:
         condition: service_healthy

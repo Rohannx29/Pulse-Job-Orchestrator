@@ -111,10 +111,10 @@ def dispatch_webhooks_for_event(
             delivery_ids.append(delivery.id)
 
             try:
-                from app.tasks import deliver_webhook
-                deliver_webhook.apply_async(args=[delivery.id], queue="pulse.internal")
+                from app.outbox import record_webhook_dispatch_outbox
+                record_webhook_dispatch_outbox(db, delivery.id)
             except Exception as exc:
-                logger.debug("Failed to enqueue deliver_webhook for %s: %s", delivery.id, exc)
+                logger.debug("Failed to record webhook outbox dispatch for %s: %s", delivery.id, exc)
 
     if delivery_ids:
         db.commit()

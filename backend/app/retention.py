@@ -29,7 +29,10 @@ from app.models import (
     JobExecution,
     JobLog,
     JobStatus,
+    OutboxEvent,
+    OutboxStatus,
     User,
+    WebhookDelivery,
     WorkerHeartbeat,
 )
 from app.timeutils import utcnow
@@ -52,6 +55,8 @@ def run_retention_prune(
     pruned_executions = 0
     pruned_jobs = 0
     pruned_audit_logs = 0
+    pruned_outbox_events = 0
+    pruned_webhook_deliveries = 0
 
     logger.info("Starting automated data retention prune (batch_size=%d)...", batch)
 
@@ -143,8 +148,58 @@ def run_retention_prune(
             if len(ids) < batch:
                 break
 
+    # 6. Prune Dispatched Outbox Events
+    if settings.OUTBOX_RETENTION_DAYS > 0:
+        outbox_cutoff = now - timedelta(days=settings.OUTBOX_RETENTION_DAYS)
+        while True:
+            subq = (
+                db.query(OutboxEvent.id)
+                .filter(
+                    OutboxEvent.status == OutboxStatus.DISPATCHED,
+                    OutboxEvent.published_at.isnot(None),
+                    OutboxEvent.published_at < outbox_cutoff,
+                )
+                .limit(batch)
+                .all()
+            )
+            ids = [r[0] for r in subq]
+            if not ids:
+                break
+            db.query(OutboxEvent).filter(OutboxEvent.id.in_(ids)).delete(synchronize_session=False)
+            db.commit()
+            pruned_outbox_events += len(ids)
+            if len(ids) < batch:
+                break
+
+    # 7. Prune Historical Webhook Deliveries
+    if settings.WEBHOOK_DELIVERY_RETENTION_DAYS > 0:
+        webhook_cutoff = now - timedelta(days=settings.WEBHOOK_DELIVERY_RETENTION_DAYS)
+        while True:
+            subq = (
+                db.query(WebhookDelivery.id)
+                .filter(WebhookDelivery.delivered_at < webhook_cutoff)
+                .limit(batch)
+                .all()
+            )
+            ids = [r[0] for r in subq]
+            if not ids:
+                break
+            db.query(WebhookDelivery).filter(WebhookDelivery.id.in_(ids)).delete(synchronize_session=False)
+            db.commit()
+            pruned_webhook_deliveries += len(ids)
+            if len(ids) < batch:
+                break
+
     duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-    total_pruned = pruned_heartbeats + pruned_logs + pruned_executions + pruned_jobs + pruned_audit_logs
+    total_pruned = (
+        pruned_heartbeats
+        + pruned_logs
+        + pruned_executions
+        + pruned_jobs
+        + pruned_audit_logs
+        + pruned_outbox_events
+        + pruned_webhook_deliveries
+    )
 
     # Record Prometheus metrics
     record_data_pruned("worker_heartbeats", pruned_heartbeats)
@@ -152,6 +207,8 @@ def run_retention_prune(
     record_data_pruned("job_executions", pruned_executions)
     record_data_pruned("jobs", pruned_jobs)
     record_data_pruned("audit_logs", pruned_audit_logs)
+    record_data_pruned("outbox_events", pruned_outbox_events)
+    record_data_pruned("webhook_deliveries", pruned_webhook_deliveries)
     record_prune_run()
 
     summary = {
@@ -162,6 +219,8 @@ def run_retention_prune(
         "pruned_job_executions": pruned_executions,
         "pruned_completed_jobs": pruned_jobs,
         "pruned_audit_logs": pruned_audit_logs,
+        "pruned_outbox_events": pruned_outbox_events,
+        "pruned_webhook_deliveries": pruned_webhook_deliveries,
         "duration_ms": duration_ms,
         "timestamp": now.isoformat(),
     }
@@ -184,7 +243,7 @@ def run_retention_prune(
 
     logger.info(
         "Data retention prune finished in %sms: %d rows deleted "
-        "(heartbeats: %d, logs: %d, executions: %d, jobs: %d, audit: %d)",
+        "(heartbeats: %d, logs: %d, executions: %d, jobs: %d, audit: %d, outbox: %d, webhooks: %d)",
         duration_ms,
         total_pruned,
         pruned_heartbeats,
@@ -192,6 +251,8 @@ def run_retention_prune(
         pruned_executions,
         pruned_jobs,
         pruned_audit_logs,
+        pruned_outbox_events,
+        pruned_webhook_deliveries,
     )
 
     return summary

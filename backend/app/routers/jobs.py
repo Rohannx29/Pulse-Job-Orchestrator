@@ -39,9 +39,6 @@ def _get_owned_job(db: Session, job_id: str, user: User) -> Job:
 
 
 
-def _dispatch(job: Job):
-    dispatch_job(job)
-
 
 @router.post("/projects/{project_id}/queues/{queue_id}/jobs", response_model=JobOut, status_code=201)
 def create_job(
@@ -135,13 +132,13 @@ def create_job(
             return existing
         raise
 
-    # Commit BEFORE dispatching to Celery
+    # Only stage dispatch outbox if runnable (QUEUED or SCHEDULED), not BLOCKED by dependencies or DEAD_LETTER
+    if job.status not in (JobStatus.BLOCKED, JobStatus.DEAD_LETTER):
+        dispatch_job(job, db=db)
+
+    # Commit state change and outbox records atomically at the outer transaction boundary
     db.commit()
     db.refresh(job)
-
-    # Only dispatch if not held back by uncompleted dependencies
-    if job.status == JobStatus.QUEUED:
-        _dispatch(job)
 
     return job
 
@@ -176,11 +173,8 @@ def create_jobs_batch(
         job = Job(queue_id=queue.id, batch_id=batch_id, **item_data)
         db.add(job)
         jobs.append(job)
-    db.flush()
-    db.commit()  # all rows visible before any of them can be dispatched
-    for job in jobs:
-        _dispatch(job)
-    db.commit()
+        dispatch_job(job, db=db)
+    db.commit()  # all jobs and their outbox events committed in a single atomic transaction
     for job in jobs:
         db.refresh(job)
     return jobs
@@ -273,6 +267,7 @@ def retry_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(g
         db.delete(job.dead_letter_entry)
 
     job.current_retry_count = 0
+    job.dispatch_generation = (getattr(job, "dispatch_generation", None) or 1) + 1
     job.run_at = None
     from app.audit import log_audit_event
     log_audit_event(
@@ -282,10 +277,13 @@ def retry_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(g
         resource_id=job.id,
         user=user,
         org_id=job.queue.project.org_id,
-        details={"job_name": job.name, "queue_id": job.queue_id},
+        details={
+            "job_name": job.name,
+            "queue_id": job.queue_id,
+            "dispatch_generation": job.dispatch_generation,
+        },
     )
-    db.commit()
-    _dispatch(job)
+    dispatch_job(job, db=db)
     db.commit()
     db.refresh(job)
     return job

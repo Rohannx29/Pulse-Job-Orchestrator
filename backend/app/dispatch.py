@@ -1,8 +1,11 @@
-"""Single place that knows how to hand a Job to the execution pipeline.
+"""Single place that stages a Job for the transactional outbox pipeline.
 
-Records a durable Transactional Outbox event in PostgreSQL before triggering Celery,
-guaranteeing state changes are committed first, preventing duplicate dispatch
-caused by internal races or network partitions.
+Guarantees:
+- Never creates an independent database session.
+- Never commits the caller's transaction.
+- Never performs external publication (Celery/Redis/webhooks) inside the request/mutation path.
+- State changes (Job status, dispatch outbox row, and event outbox row) are staged
+  in the SAME caller-owned session and committed atomically at the outer transaction boundary.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.models import Job, JobStatus
 from app.timeutils import utcnow
@@ -19,45 +22,49 @@ logger = logging.getLogger(__name__)
 
 
 def dispatch_job(job: Job, db: Optional[Session] = None) -> None:
-    """Dispatches a job by recording an OutboxEvent and publishing it.
+    """Stages a Job for dispatch by recording an OutboxEvent in the caller's session.
 
-    If a database session is provided, records in that session; otherwise uses SessionLocal.
-    Guarantees the outbox record is committed to PostgreSQL before attempting Celery publish.
+    Does NOT commit the session and does NOT publish to Celery/Redis immediately.
+    The caller must commit the transaction at the outer boundary.
     """
-    from app.database import SessionLocal
-    from app.outbox import publish_pending_outbox_events, record_event_outbox, record_job_dispatch_outbox
+    from app.outbox import record_event_outbox, record_job_dispatch_outbox
 
+    session = db or object_session(job)
+    if session is None:
+        raise ValueError("A valid database session or bound Job instance is required to stage outbox dispatch.")
+
+    # Durable status assignment: SCHEDULED for future runs, QUEUED for runnable jobs
     if job.run_at and job.run_at > utcnow():
         job.status = JobStatus.SCHEDULED
     else:
         job.status = JobStatus.QUEUED
 
-    session = db or SessionLocal()
-    should_close = (db is None)
+    if getattr(job, "dispatch_generation", None) is None or job.dispatch_generation < 1:
+        job.dispatch_generation = 1
 
-    try:
-        record_job_dispatch_outbox(session, job)
-        if job.queue and job.queue.project:
-            record_event_outbox(
-                session,
-                job.queue.project.org_id,
-                "job.queued" if job.status == JobStatus.QUEUED else "job.scheduled",
-                {
-                    "job_id": job.id,
-                    "queue_id": job.queue_id,
-                    "name": job.name,
-                    "status": job.status.value,
-                    "priority": job.priority,
-                },
-            )
-        session.commit()
+    # Stage the dispatch outbox record
+    record_job_dispatch_outbox(session, job)
 
-        # Immediate outbox publication attempt for minimal latency
-        try:
-            publish_pending_outbox_events(session)
-        except Exception as exc:
-            logger.debug("Immediate outbox publish deferred to background worker: %s", exc)
+    # Stage the real-time event notification in the same session
+    org_id = None
+    if job.queue and getattr(job.queue, "project", None):
+        org_id = job.queue.project.org_id
+    elif getattr(job, "queue_id", None):
+        from app.models import Queue
+        q = session.get(Queue, job.queue_id)
+        if q and q.project:
+            org_id = q.project.org_id
 
-    finally:
-        if should_close:
-            session.close()
+    if org_id:
+        record_event_outbox(
+            session,
+            org_id,
+            "job.queued" if job.status == JobStatus.QUEUED else "job.scheduled",
+            {
+                "job_id": job.id,
+                "queue_id": job.queue_id,
+                "name": job.name,
+                "status": job.status.value,
+                "priority": job.priority,
+            },
+        )

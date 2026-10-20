@@ -21,10 +21,14 @@ from app.models import (
     JobStatus,
     LogLevel,
     Organization,
+    OutboxEvent,
+    OutboxStatus,
     Project,
     Queue,
     User,
     UserRole,
+    WebhookDelivery,
+    WebhookSubscription,
     Worker,
     WorkerHeartbeat,
     WorkerStatus,
@@ -158,4 +162,83 @@ def test_prune_terminal_jobs_only(db_session):
     assert audit is not None
     assert audit.user_id == user.id
     assert audit.details["pruned_completed_jobs"] == 1
+
+
+def test_prune_outbox_events_and_webhook_deliveries(db_session):
+    now = utcnow()
+    user = User(email="retention_owner@example.com", hashed_password="pwd", role=UserRole.ORG_ADMIN)
+    org = Organization(name="RetentionOrg", owner=user)
+    db_session.add_all([user, org])
+    db_session.commit()
+
+    # 1. Outbox events:
+    # Stale dispatched outbox event (20 days ago) -> should be pruned
+    stale_dispatched = OutboxEvent(
+        event_type="job.completed",
+        aggregate_type="job",
+        aggregate_id="job-1",
+        status=OutboxStatus.DISPATCHED,
+        published_at=now - timedelta(days=20),
+    )
+    # Stale pending outbox event (20 days ago) -> should NOT be pruned (not dispatched)
+    stale_pending = OutboxEvent(
+        event_type="job.completed",
+        aggregate_type="job",
+        aggregate_id="job-2",
+        status=OutboxStatus.PENDING,
+        created_at=now - timedelta(days=20),
+    )
+    # Fresh dispatched outbox event (2 days ago) -> should NOT be pruned
+    fresh_dispatched = OutboxEvent(
+        event_type="job.completed",
+        aggregate_type="job",
+        aggregate_id="job-3",
+        status=OutboxStatus.DISPATCHED,
+        published_at=now - timedelta(days=2),
+    )
+    db_session.add_all([stale_dispatched, stale_pending, fresh_dispatched])
+
+    # 2. Webhook deliveries:
+    sub = WebhookSubscription(
+        org_id=org.id,
+        url="https://example.com/webhook",
+        secret="whsec_test_secret_123",
+    )
+    db_session.add(sub)
+    db_session.commit()
+
+    # Stale delivery (45 days ago) -> should be pruned
+    stale_delivery = WebhookDelivery(
+        subscription_id=sub.id,
+        event="job.completed",
+        payload={"job_id": "1"},
+        delivered_at=now - timedelta(days=45),
+    )
+    # Fresh delivery (3 days ago) -> should NOT be pruned
+    fresh_delivery = WebhookDelivery(
+        subscription_id=sub.id,
+        event="job.completed",
+        payload={"job_id": "2"},
+        delivered_at=now - timedelta(days=3),
+    )
+    db_session.add_all([stale_delivery, fresh_delivery])
+    db_session.commit()
+
+    stale_disp_id = stale_dispatched.id
+    stale_pend_id = stale_pending.id
+    fresh_disp_id = fresh_dispatched.id
+    stale_del_id = stale_delivery.id
+    fresh_del_id = fresh_delivery.id
+
+    summary = run_retention_prune(db_session, batch_size=10)
+
+    assert summary["pruned_outbox_events"] == 1
+    assert summary["pruned_webhook_deliveries"] == 1
+
+    assert db_session.query(OutboxEvent).filter(OutboxEvent.id == stale_disp_id).first() is None
+    assert db_session.query(OutboxEvent).filter(OutboxEvent.id == stale_pend_id).first() is not None
+    assert db_session.query(OutboxEvent).filter(OutboxEvent.id == fresh_disp_id).first() is not None
+
+    assert db_session.query(WebhookDelivery).filter(WebhookDelivery.id == stale_del_id).first() is None
+    assert db_session.query(WebhookDelivery).filter(WebhookDelivery.id == fresh_del_id).first() is not None
 

@@ -13,7 +13,9 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-ARG NEXT_PUBLIC_API_URL
+ARG INTERNAL_API_URL=http://api:8000
+ENV INTERNAL_API_URL=${INTERNAL_API_URL}
+ARG NEXT_PUBLIC_API_URL=/api
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 RUN npm run build
 
@@ -24,6 +26,7 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
+ENV INTERNAL_API_URL=http://api:8000
 
 # Run as non-root user
 RUN addgroup --system --gid 1001 nodejs && \

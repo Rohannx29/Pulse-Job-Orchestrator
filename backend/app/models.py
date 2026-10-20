@@ -249,6 +249,7 @@ class Job(Base):
 
     max_retries = Column(Integer, nullable=False, default=3)
     current_retry_count = Column(Integer, nullable=False, default=0)
+    dispatch_generation = Column(Integer, nullable=False, default=1, server_default="1")
 
     celery_task_id = Column(String(155), nullable=True, index=True)
     claimed_by_worker_id = Column(UUID(as_uuid=False), ForeignKey("workers.id", ondelete="SET NULL"), nullable=True)

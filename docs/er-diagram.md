@@ -44,6 +44,7 @@ Sensitive operator mutations (queue pause/resume, queue configuration edits, job
 
 ```text
 Job
+ ├── dispatch_generation (Integer, default 1: monotonic fencing key generation)
  ├── JobExecution × N
  │     └── JobLog × N
  └── DeadLetterJob (0..1 current record)
@@ -142,6 +143,7 @@ JobSchedule ── owns ──> ScheduleOccurrence × N (schedule_occurrences)
 - `outbox_events.fencing_key` is unique and indexed.
 - `(schedule_id, scheduled_fire_time)` is unique in `schedule_occurrences` (`uq_schedule_occurrence_fire_time`).
 - `schedule_occurrences.schedule_id` is foreign-keyed to `job_schedules.id` with `CASCADE`.
+- `jobs.dispatch_generation` is a non-null integer column (`server_default='1'`) incremented monotonically on every dispatch, retry, and DLQ re-enqueue to prevent duplicate queue runs under races.
 - Named foreign keys: `jobs.depends_on_job_id` uses explicit constraint name `fk_jobs_depends_on_job_id` for deterministic migration downgrade and multi-dialect compatibility.
 - Keyset pagination compound indexes:
   - `(queue_id, created_at DESC)` on `jobs` (`ix_jobs_queue_created`)

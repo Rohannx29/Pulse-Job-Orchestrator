@@ -41,6 +41,7 @@ from app.models import (
     WorkerHeartbeat,
     WorkerStatus,
 )
+from app.outbox import record_event_outbox
 from app.worker_registry import get_or_create_worker
 _redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
@@ -165,13 +166,36 @@ def _cascade_fail_dependents(db, dead_job: Job, reason: str):
 
 
 @celery_app.task(bind=True, name="app.tasks.execute_job")
-def execute_job(self, job_id: str):
+def execute_job(self, job_id: str, **kwargs):
     db = SessionLocal()
     try:
         job: Job | None = db.get(Job, job_id)
         if job is None:
             logger.warning("Job %s no longer exists, skipping", job_id)
             return
+
+        # Durable state guard: a task cannot execute while persisted as BLOCKED or terminal
+        if job.status == JobStatus.BLOCKED:
+            logger.warning("Job %s is still BLOCKED in database; refusing premature execution", job_id)
+            return
+
+        if job.status in (JobStatus.COMPLETED, JobStatus.DEAD_LETTER):
+            logger.info("Job %s already in terminal state %s; skipping execution", job_id, job.status.value)
+            return
+
+        # Fencing guard: if dispatch_generation was provided in task kwargs,
+        # ensure it matches the current persisted dispatch_generation.
+        # Stale dispatches from previous generations are dropped.
+        dispatch_gen = kwargs.get("dispatch_generation")
+        if dispatch_gen is not None and getattr(job, "dispatch_generation", None) is not None:
+            if job.dispatch_generation != dispatch_gen:
+                logger.warning(
+                    "Stale task execution for job %s: payload generation %s != DB generation %s. Dropping.",
+                    job.id,
+                    dispatch_gen,
+                    job.dispatch_generation,
+                )
+                return
 
         queue: Queue = db.get(Queue, job.queue_id)
 
@@ -199,17 +223,17 @@ def execute_job(self, job_id: str):
         worker = get_or_create_worker(db, self.request.hostname)
         job.status = JobStatus.CLAIMED
         job.claimed_by_worker_id = worker.id
-        db.commit()
 
         org_id = get_job_org_id(db, job)
         if org_id:
-            publish_event(org_id, "job.claimed", {
+            record_event_outbox(db, org_id, "job.claimed", {
                 "job_id": job.id,
                 "queue_id": queue.id,
                 "worker_id": worker.id,
                 "worker_hostname": self.request.hostname,
                 "status": JobStatus.CLAIMED.value,
             })
+        db.commit()
 
         try:
             _execute_job_inner(self, db, job, worker, org_id)
@@ -239,16 +263,16 @@ def _execute_job_inner(self, db, job: Job, worker: Worker, org_id: str | None = 
         db.add(execution)
         db.flush()
         _log(db, execution, LogLevel.INFO, f"Attempt {attempt_number} started on worker {self.request.hostname}")
-        db.commit()
 
         if org_id:
-            publish_event(org_id, "job.running", {
+            record_event_outbox(db, org_id, "job.running", {
                 "job_id": job.id,
                 "queue_id": job.queue_id,
                 "worker_id": worker.id,
                 "attempt_number": attempt_number,
                 "status": JobStatus.RUNNING.value,
             })
+        db.commit()
 
         result = _run_handler(job.payload)
 
@@ -258,15 +282,14 @@ def _execute_job_inner(self, db, job: Job, worker: Worker, org_id: str | None = 
         _log(db, execution, LogLevel.INFO, "Completed successfully")
 
         job.status = JobStatus.COMPLETED
-        db.commit()
-
         if org_id:
-            publish_event(org_id, "job.completed", {
+            record_event_outbox(db, org_id, "job.completed", {
                 "job_id": job.id,
                 "queue_id": job.queue_id,
                 "status": JobStatus.COMPLETED.value,
                 "result": result,
             })
+        db.commit()
 
         _release_dependents(db, job)
 
@@ -289,12 +312,12 @@ def _execute_job_inner(self, db, job: Job, worker: Worker, org_id: str | None = 
 
         if job.current_retry_count < job.max_retries:
             job.current_retry_count += 1
+            job.dispatch_generation = (getattr(job, "dispatch_generation", None) or 1) + 1
             job.status = JobStatus.QUEUED
-            db.commit()
             delay = _compute_backoff_seconds(policy, job.current_retry_count)
-            logger.info("Retrying job %s in %ss (attempt %s/%s)", job.id, delay, job.current_retry_count, job.max_retries)
+            logger.info("Retrying job %s in %ss (attempt %s/%s, generation %s)", job.id, delay, job.current_retry_count, job.max_retries, job.dispatch_generation)
             if org_id:
-                publish_event(org_id, "job.failed", {
+                record_event_outbox(db, org_id, "job.failed", {
                     "job_id": job.id,
                     "queue_id": job.queue_id,
                     "attempt_number": job.current_retry_count,
@@ -303,10 +326,12 @@ def _execute_job_inner(self, db, job: Job, worker: Worker, org_id: str | None = 
                     "error_message": str(exc),
                     "status": JobStatus.QUEUED.value,
                 })
-            raise self.retry(exc=exc, countdown=delay, max_retries=job.max_retries)
+            db.commit()
+            raise self.retry(exc=exc, countdown=delay, max_retries=job.max_retries, kwargs={"dispatch_generation": job.dispatch_generation})
 
         # Retries exhausted -> Dead Letter Queue
         job.status = JobStatus.DEAD_LETTER
+        job.dispatch_generation = (getattr(job, "dispatch_generation", None) or 1) + 1
         db.add(
             DeadLetterJob(
                 job_id=job.id,
@@ -315,16 +340,15 @@ def _execute_job_inner(self, db, job: Job, worker: Worker, org_id: str | None = 
                 retry_count_at_failure=job.current_retry_count,
             )
         )
-        db.commit()
-        logger.warning("Job %s exhausted retries, moved to DLQ", job.id)
-
         if org_id:
-            publish_event(org_id, "job.dead_letter", {
+            record_event_outbox(db, org_id, "job.dead_letter", {
                 "job_id": job.id,
                 "queue_id": job.queue_id,
                 "reason": str(exc),
                 "status": JobStatus.DEAD_LETTER.value,
             })
+        db.commit()
+        logger.warning("Job %s exhausted retries, moved to DLQ", job.id)
 
         _cascade_fail_dependents(db, job, str(exc))
 
@@ -475,10 +499,10 @@ def dispatch_due_schedules():
 
                 occurrence.dispatched_job_id = job.id
                 schedule.last_dispatched_at = now
-                db.commit()
 
-                # 5. Dispatch via Transactional Outbox
+                # 5. Dispatch via Transactional Outbox in the SAME transaction
                 dispatch_job(job, db=db)
+                db.commit()
                 logger.info(
                     "Dispatched scheduled job %s from schedule %s for fire time %s",
                     job.id,
@@ -500,11 +524,14 @@ def dispatch_due_schedules():
 
 @celery_app.task(name="app.tasks.process_outbox_events")
 def process_outbox_events():
-    """Runs on a Beat interval. Polls and dispatches pending Transactional Outbox events."""
-    from app.outbox import publish_pending_outbox_events
+    """Runs on a Beat interval. Reconciles stranded jobs and publishes pending Transactional Outbox events."""
+    from app.outbox import publish_pending_outbox_events, reconcile_stranded_jobs
 
     db = SessionLocal()
     try:
+        reconciled = reconcile_stranded_jobs(db, max_age_seconds=30, limit=50)
+        if reconciled > 0:
+            logger.info("Outbox publisher reconciled %d stranded jobs", reconciled)
         dispatched = publish_pending_outbox_events(db, batch_size=50)
         if dispatched > 0:
             logger.info("Outbox publisher dispatched %d pending events", dispatched)

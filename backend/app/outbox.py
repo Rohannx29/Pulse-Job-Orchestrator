@@ -38,17 +38,16 @@ def record_job_dispatch_outbox(
     from app.logging_config import get_correlation_id
 
     corr_id = get_correlation_id() or str(job.id)
-    celery_queue = priority_to_celery_queue(job.priority)
+    celery_queue = priority_to_celery_queue(job.priority if job.priority is not None else 5)
     eta = job.run_at if (job.run_at and job.run_at > utcnow()) else None
 
-    # Use unique fencing key to prevent multiple dispatch events for the exact same job state
-    # e.g., "job:dispatch:<job_id>:<retry_count>"
-    actual_fencing_key = fencing_key or f"job:dispatch:{job.id}:{job.current_retry_count}"
+    generation = getattr(job, "dispatch_generation", None) or 1
+    actual_fencing_key = fencing_key or f"job:dispatch:{job.id}:{generation}"
 
     payload = {
         "task_name": "app.tasks.execute_job",
         "args": [str(job.id)],
-        "kwargs": {},
+        "kwargs": {"dispatch_generation": generation},
         "queue": celery_queue,
         "eta": eta.isoformat() if eta else None,
         "headers": {"correlation_id": corr_id},
@@ -217,3 +216,106 @@ def publish_pending_outbox_events(db: Session, batch_size: int = DEFAULT_BATCH_S
 
     db.commit()
     return dispatched_count
+
+
+def reconcile_stranded_jobs(db: Session, max_age_seconds: int = 30, limit: int = 50) -> int:
+    """Detects and reconciles dispatchable jobs missing an active dispatch outbox record.
+
+    Ensures committed jobs are never stranded if a crash occurred between job creation
+    and outbox generation, or if outbox records were exhausted/lost.
+    """
+    from datetime import timedelta
+    cutoff = utcnow() - timedelta(seconds=max_age_seconds)
+    now = utcnow()
+
+    # Query dispatchable jobs: QUEUED or SCHEDULED where run_at is due
+    candidate_jobs = (
+        db.query(Job)
+        .filter(
+            Job.status.in_([JobStatus.QUEUED, JobStatus.SCHEDULED]),
+            Job.created_at <= cutoff,
+        )
+        .limit(limit)
+        .all()
+    )
+
+    reconciled_count = 0
+    for job in candidate_jobs:
+        # If SCHEDULED and run_at is still in the future, it is waiting on schedule, not stranded
+        if job.status == JobStatus.SCHEDULED and job.run_at and job.run_at > now:
+            continue
+
+        gen = getattr(job, "dispatch_generation", None) or 1
+        expected_fencing = f"job:dispatch:{job.id}:{gen}"
+
+        # Check if an active (PENDING or DISPATCHED) outbox record exists
+        has_outbox = (
+            db.query(OutboxEvent.id)
+            .filter(
+                OutboxEvent.aggregate_id == str(job.id),
+                OutboxEvent.aggregate_type == "job",
+                OutboxEvent.fencing_key == expected_fencing,
+                OutboxEvent.status.in_([OutboxStatus.PENDING, OutboxStatus.DISPATCHED]),
+            )
+            .first()
+        )
+
+        if not has_outbox:
+            # Job is stranded! Bump generation to avoid any stale duplicate collision and record outbox
+            job.dispatch_generation = gen + 1
+            record_job_dispatch_outbox(db, job)
+            logger.warning(
+                "Reconciled stranded job %s: advanced to generation %d and staged outbox dispatch",
+                job.id,
+                job.dispatch_generation,
+            )
+            reconciled_count += 1
+            try:
+                from app.metrics import pulse_outbox_reconciled_total
+                pulse_outbox_reconciled_total.inc()
+            except Exception:
+                pass
+
+    if reconciled_count > 0:
+        db.commit()
+
+    return reconciled_count
+
+
+def get_outbox_stats(db: Session) -> Dict[str, Any]:
+    """Returns operational observability metrics for the outbox table."""
+    from sqlalchemy import func
+
+    pending_count = db.query(func.count(OutboxEvent.id)).filter(OutboxEvent.status == OutboxStatus.PENDING).scalar() or 0
+    failed_count = db.query(func.count(OutboxEvent.id)).filter(OutboxEvent.status == OutboxStatus.FAILED).scalar() or 0
+
+    oldest_pending = (
+        db.query(OutboxEvent.created_at)
+        .filter(OutboxEvent.status == OutboxStatus.PENDING)
+        .order_by(OutboxEvent.created_at.asc())
+        .first()
+    )
+    oldest_pending_age_seconds = None
+    if oldest_pending and oldest_pending[0]:
+        oldest_pending_age_seconds = max(0.0, (utcnow() - oldest_pending[0]).total_seconds())
+
+    return {
+        "pending_count": pending_count,
+        "failed_count": failed_count,
+        "oldest_pending_age_seconds": oldest_pending_age_seconds,
+    }
+
+
+def replay_failed_outbox_event(db: Session, event_id: str) -> Optional[OutboxEvent]:
+    """Idempotently resets a FAILED outbox event back to PENDING for retry."""
+    event = db.get(OutboxEvent, event_id)
+    if not event:
+        return None
+
+    if event.status == OutboxStatus.FAILED:
+        event.status = OutboxStatus.PENDING
+        event.retry_count = 0
+        event.last_error = None
+        db.commit()
+        db.refresh(event)
+    return event

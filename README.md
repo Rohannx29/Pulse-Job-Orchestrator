@@ -358,7 +358,7 @@ celery -A app.celery_app beat --loglevel=info
 
 ## Testing
 
-The backend test suite contains **111 test cases across 22 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, transactional outbox race prevention, schedule deduplication, cookie authentication, network security, SSRF defense in depth, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, data integrity bounds, cross-tenant retry policy isolation, cursor pagination, and Alembic migration round-trips. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
+The backend test suite contains **123 test cases (112 unit and integration tests verified passing, 11 live-service integration tests skipped when PostgreSQL/Redis service containers are offline) across 22 test modules** in `backend/tests/`, covering retry math, priority mapping, concurrency, multi-parent DAG dependencies, transactional outbox race prevention, monotonic generation fencing, schedule deduplication, cookie authentication, network security, DNS-rebinding transport defense, KMS webhook encryption, secret rotation with grace windows, delivery redaction, rate limiting, data integrity bounds, cross-tenant retry policy isolation, cursor pagination, automated table pruning, and Alembic migration round-trips. In addition, the frontend includes 5 end-to-end automated browser test suites in `frontend/e2e/` powered by Playwright.
 
 Run backend tests:
 
@@ -411,20 +411,28 @@ Pulse supports distinct deployment profiles tailored for local evaluation, conti
 - **Fail-Closed Malformed Cron**: If an invalid cron syntax is encountered in legacy data, the schedule is automatically disabled (`is_active=False`), marked invalid, and audited (`schedule.invalid_disabled`), allowing other healthy schedules to continue uninterrupted.
 
 ### 3. Transactional outbox delivery semantics
-- **Atomic Database Persistence**: Every state transition that causes an external side effect (Celery job dispatch, real-time SSE broadcasts, or outbound webhooks) is written to `outbox_events` in the *same* database transaction as the aggregate change.
+- **Atomic Database Persistence**: Every state transition that causes an external side effect (Celery job dispatch, real-time SSE broadcasts, or outbound webhooks) is written to `outbox_events` in the *same* database transaction as the aggregate change. Routers and background workers commit outer transactions exactly once.
+- **Monotonic Generation Fencing**: Jobs persist a monotonic `dispatch_generation` integer column (`server_default='1'`). Fencing keys use `job:dispatch:{id}:{generation}`, eliminating internal double-dispatch across retries, crash windows, and DLQ re-enqueue.
 - **Row-Locked Polling Publisher**: A periodic Celery worker claims pending outbox rows using `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL, guaranteeing concurrent publishers never double-claim or race.
-- **Worker Crash Recovery**: If a publisher crashes after dispatching to Celery but before updating the outbox row, the task is safely redelivered under at-least-once semantics with retry counts bounded to 5 attempts.
+- **Worker Crash Recovery & Durable State Guard**: If a publisher crashes after dispatching to Celery but before updating the outbox row, the task is safely redelivered under at-least-once semantics with retry counts bounded to 5 attempts. A durable state guard in Celery workers drops tasks if the durable database state is terminal or blocked.
+- **Idempotent Reconciliation**: `reconcile_stranded_jobs` runs every 30 seconds to detect runnable jobs (`QUEUED` or `SCHEDULED`) missing a pending/dispatched outbox event and safely stages them with audit logging and Prometheus metrics (`pulse_outbox_reconciled_total`).
+- **RBAC Outbox Inspection & Replay**: Administrators can inspect outbox backlogs (`GET /admin/outbox/stats`, `GET /admin/outbox/events`) and trigger idempotent replays (`POST /admin/outbox/events/{id}/replay`).
 
 ### 4. Data retention & table pruning
 - **Automated Celery Beat Pruning**: Running on `pulse.internal`, the retention engine runs hourly batch deletions:
-  - Job logs & execution history: purged after 30 days.
-  - Completed jobs: purged after 60 days.
-  - Worker heartbeats: purged after 7 days.
-  - Immutable audit logs: retained for 365 days.
+  - Job logs & execution history: purged after 30 days (`JOB_LOG_RETENTION_DAYS`).
+  - Completed & dead-letter jobs: purged after 60 days (`COMPLETED_JOB_RETENTION_DAYS`).
+  - Worker heartbeats: purged after 7 days (`HEARTBEAT_RETENTION_DAYS`).
+  - Dispatched transactional outbox events: purged after 14 days (`OUTBOX_RETENTION_DAYS`).
+  - Historical webhook deliveries: purged after 30 days (`WEBHOOK_DELIVERY_RETENTION_DAYS`).
+  - Immutable audit logs: retained for 365 days (`AUDIT_LOG_RETENTION_DAYS`).
 - **Chunked Batch Deletions**: Deletes are executed in bounded batches (1,000 rows/batch) to avoid database lock contention and transaction log bloat.
+- **Operator Execution**: Admins can invoke pruning on demand via `POST /admin/prune`.
 
 ### 5. Webhook secret lifecycle & KMS encryption
 - **Secret Generation & Storage**: Webhook secrets are generated with high entropy (`whsec_...`) and encrypted at rest in PostgreSQL via Fernet AES-128 (`enc:v1:...`).
+- **Separate Mandatory Encryption Key**: Non-development environments require an independent 32-byte `WEBHOOK_ENCRYPTION_KEY` and reject reuse of application `SECRET_KEY`.
+- **Resumable Migration & Key Rotation**: Legacy plaintext secrets can be safely encrypted in batches via administrative CLI (`python -m app.commands.encrypt_webhook_secrets`) or API endpoint (`POST /admin/webhooks/encrypt-secrets`).
 - **Single Raw Secret Exposure**: The raw secret is returned in plaintext *exactly once* upon creation or rotation (`WebhookSubscriptionCreateOut`). All subsequent GET and LIST endpoints mask or omit the secret.
 - **Dual-Signing Rotation Grace Window**: Non-destructive rotation creates a new active secret while preserving the previous secret and stamping `previous_secret_expires_at` (default 24 hours). Inbound delivery verification accepts signatures signed by either key until the window expires.
 - **Org-Admin Access Boundary**: Creation, modification, deletion, secret rotation, and delivery log inspection are restricted to the `org_admin` or `system_admin` role. Regular members receive `403 Forbidden`.
@@ -438,8 +446,8 @@ Pulse supports distinct deployment profiles tailored for local evaluation, conti
 
 | Threat Vector | Mitigation Strategy | Remaining Accepted Risk / Production Recommendation |
 |---|---|---|
-| **Server-Side Request Forgery (SSRF)** | Integrated HTTP transport validating all resolved IPv4/IPv6 addresses, blocking RFC1918, loopback, link-local, and cloud metadata (`169.254.169.254`). Redirects strictly disabled (`follow_redirects=False`). Payload capped at 1MB. | Dedicated egress proxy or firewall recommended in enterprise clouds to defend against low-level hardware DNS rebinding. |
-| **Token Theft & Credential Leakage** | Query-string JWT authentication completely removed. Enforced httpOnly access/refresh cookies with rotating tokens. Single-use 60s SSE connection tickets. | In cross-origin deployments without reverse proxying, secure cookie domain and CORS settings must be strictly configured. |
+| **Server-Side Request Forgery (SSRF) & DNS Rebinding** | Custom HTTP transport (`SafeSyncBackend`) pre-resolves hostnames, connects strictly to validated public IPs, and re-validates the connected socket peer (`getpeername()`), blocking RFC1918, loopback, link-local, and cloud metadata (`169.254.169.254`). Redirects strictly disabled (`follow_redirects=False`). Payload capped at 1MB. | Dedicated egress gateway or isolated VPC recommended in enterprise clouds for strict network-level egress enforcement. |
+| **Token Theft & Credential Leakage** | Query-string JWT authentication completely removed. Enforced httpOnly access/refresh cookies with rotating tokens. Single-use 60s SSE connection tickets via `X-SSE-Ticket` header or cookie with `Referrer-Policy: no-referrer`. | In cross-origin deployments without reverse proxying, secure cookie domain and CORS settings must be strictly configured. |
 | **Rate-Limiter Spoofing & DoS** | Client IP extracted from `X-Forwarded-For` *only* when the direct socket connection matches `TRUSTED_PROXIES`. Sensitive auth routes fail closed (`503`) during Redis outages. 256KB payload caps and 100-job batch limits protect DB memory. | Trusted proxy list must be updated if cloud load balancer IP ranges change. |
 | **Cross-Site Request Forgery (CSRF)** | `CSRFProtectionMiddleware` verifies `Origin` and `Referer` headers against `CORS_ORIGINS` for all state-modifying requests bearing cookies. | Custom client applications communicating via raw curl/Postman without cookies are unaffected. |
 | **Cryptographic Key Compromise** | Webhook secrets encrypted at rest with Fernet AES-128. Single raw secret exposure on write. Redacted delivery logs. | Production deployments with strict compliance requirements should integrate hardware-backed keys (AWS KMS / GCP Cloud KMS). |

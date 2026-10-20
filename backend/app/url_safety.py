@@ -21,6 +21,7 @@ import socket
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
+import httpcore
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,62 @@ CLOUD_METADATA_IPS = {
     ipaddress.ip_address("169.254.169.254"),
     ipaddress.ip_address("100.100.100.200"),
 }
+
+
+class SafeSyncBackend(httpcore.SyncBackend):
+    """Custom HTTP transport backend that enforces connection to a validated public IP
+    and inspects the actual connected socket peer to eliminate DNS rebinding."""
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: Optional[float] = None,
+        local_address: Optional[str] = None,
+        socket_options: Optional[Any] = None,
+    ) -> Any:
+        # Pre-connect DNS resolution check
+        try:
+            addrinfo = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+            validated_ips = []
+            for item in addrinfo:
+                ip_str = item[4][0]
+                ip = ipaddress.ip_address(ip_str)
+                if is_ip_disallowed(ip):
+                    raise ValueError(f"DNS resolution blocked: {host} resolves to disallowed IP {ip_str}")
+                validated_ips.append(ip_str)
+        except socket.gaierror as exc:
+            raise ValueError(f"Could not resolve hostname {host!r}: {exc}")
+
+        if not validated_ips:
+            raise ValueError(f"No IP addresses resolved for {host!r}")
+
+        # Connect directly to the validated IP, eliminating TOCTOU DNS races
+        target_ip = validated_ips[0]
+        stream = super().connect_tcp(
+            target_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+        # Post-connection socket verification: re-verify connected peer address
+        try:
+            sock = getattr(stream, "_sock", None)
+            if sock:
+                connected_ip_str = sock.getpeername()[0]
+                connected_ip = ipaddress.ip_address(connected_ip_str)
+                if is_ip_disallowed(connected_ip):
+                    stream.close()
+                    raise ValueError(
+                        f"DNS rebinding attack blocked: socket connected to disallowed peer IP {connected_ip_str}"
+                    )
+        except Exception as exc:
+            stream.close()
+            raise ValueError(f"Peer address verification failed: {exc}")
+
+        return stream
 
 
 def is_ip_disallowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -131,7 +188,10 @@ def execute_safe_http_request(
 
     req_headers = dict(headers or {})
 
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+    transport = httpx.HTTPTransport(verify=True)
+    transport._pool._network_backend = SafeSyncBackend()
+
+    with httpx.Client(transport=transport, timeout=timeout, follow_redirects=False) as client:
         with client.stream(
             method=method.upper(),
             url=url,

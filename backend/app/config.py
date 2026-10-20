@@ -33,6 +33,8 @@ class Settings:
     COMPLETED_JOB_RETENTION_DAYS: int = int(os.getenv("COMPLETED_JOB_RETENTION_DAYS", "60"))
     HEARTBEAT_RETENTION_DAYS: int = int(os.getenv("HEARTBEAT_RETENTION_DAYS", "7"))
     AUDIT_LOG_RETENTION_DAYS: int = int(os.getenv("AUDIT_LOG_RETENTION_DAYS", "365"))
+    OUTBOX_RETENTION_DAYS: int = int(os.getenv("OUTBOX_RETENTION_DAYS", "14"))
+    WEBHOOK_DELIVERY_RETENTION_DAYS: int = int(os.getenv("WEBHOOK_DELIVERY_RETENTION_DAYS", "30"))
     PRUNE_BATCH_SIZE: int = int(os.getenv("PRUNE_BATCH_SIZE", "1000"))
     PRUNE_INTERVAL_SECONDS: float = float(os.getenv("PRUNE_INTERVAL_SECONDS", "3600.0"))
 
@@ -76,4 +78,17 @@ if settings.SECRET_KEY == _INSECURE_DEFAULT_KEY and not settings.IS_DEV:
         "Set a cryptographically random SECRET_KEY environment variable before starting the server. "
         "To suppress this check in local development, set IS_DEV=true."
     )
+
+if not settings.IS_DEV:
+    if not settings.WEBHOOK_ENCRYPTION_KEY or not settings.WEBHOOK_ENCRYPTION_KEY.strip():
+        raise RuntimeError(
+            "WEBHOOK_ENCRYPTION_KEY is required in non-development environments. "
+            "Do not fall back to SECRET_KEY. Set a cryptographically secure 32-byte urlsafe base64 "
+            "key (e.g. via 'cryptography.fernet.Fernet.generate_key()') before starting the server."
+        )
+    if settings.WEBHOOK_ENCRYPTION_KEY == settings.SECRET_KEY:
+        raise RuntimeError(
+            "WEBHOOK_ENCRYPTION_KEY must not reuse application SECRET_KEY. "
+            "Provide a distinct cryptographic encryption key for data at rest."
+        )
 

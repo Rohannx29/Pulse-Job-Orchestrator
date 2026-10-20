@@ -36,11 +36,13 @@ class JSONFormatter(logging.Formatter):
         now = datetime.now(timezone.utc)
         corr_id = get_correlation_id()
 
+        from app.redaction import redact_sensitive_text
+
         payload: dict[str, Any] = {
             "timestamp": now.isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": redact_sensitive_text(record.getMessage()),
             "service": self.service_name,
             "module": record.module,
             "line": record.lineno,

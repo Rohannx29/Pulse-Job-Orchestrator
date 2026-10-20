@@ -29,8 +29,12 @@ async def get_sse_authenticated_user(
             if user:
                 return user
 
-    # 2. Short-lived one-time connection ticket (?ticket=sset_...)
-    ticket = request.query_params.get("ticket")
+    # 2. Short-lived one-time connection ticket (via header, cookie, or query parameter)
+    ticket = (
+        request.headers.get("X-SSE-Ticket")
+        or request.cookies.get("pulse_sse_ticket")
+        or request.query_params.get("ticket")
+    )
     if ticket:
         user_id = None
         try:
@@ -126,8 +130,9 @@ async def events_stream(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "Referrer-Policy": "no-referrer",
         },
     )

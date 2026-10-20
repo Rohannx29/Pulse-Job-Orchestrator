@@ -64,12 +64,17 @@ def update_queue(project_id: str, queue_id: str, payload: QueueUpdate, db: Sessi
         org_id=queue.project.org_id,
         details={"queue_name": queue.name, "changes": changes},
     )
-    from app.events import publish_event
-    publish_event(queue.project.org_id, "queue.updated", {
-        "queue_id": queue.id,
-        "concurrency_limit": queue.concurrency_limit,
-        "priority": queue.priority,
-    })
+    from app.outbox import record_event_outbox
+    record_event_outbox(
+        db,
+        queue.project.org_id,
+        "queue.updated",
+        {
+            "queue_id": queue.id,
+            "concurrency_limit": queue.concurrency_limit,
+            "priority": queue.priority,
+        },
+    )
     db.commit()
     db.refresh(queue)
     return queue
@@ -88,11 +93,16 @@ def pause_queue(project_id: str, queue_id: str, db: Session = Depends(get_db), u
         org_id=queue.project.org_id,
         details={"queue_name": queue.name},
     )
-    from app.events import publish_event
-    publish_event(queue.project.org_id, "queue.paused", {
-        "queue_id": queue.id,
-        "is_paused": True,
-    })
+    from app.outbox import record_event_outbox
+    record_event_outbox(
+        db,
+        queue.project.org_id,
+        "queue.paused",
+        {
+            "queue_id": queue.id,
+            "is_paused": True,
+        },
+    )
     db.commit()
     db.refresh(queue)
     return queue
@@ -111,11 +121,16 @@ def resume_queue(project_id: str, queue_id: str, db: Session = Depends(get_db), 
         org_id=queue.project.org_id,
         details={"queue_name": queue.name},
     )
-    from app.events import publish_event
-    publish_event(queue.project.org_id, "queue.resumed", {
-        "queue_id": queue.id,
-        "is_paused": False,
-    })
+    from app.outbox import record_event_outbox
+    record_event_outbox(
+        db,
+        queue.project.org_id,
+        "queue.resumed",
+        {
+            "queue_id": queue.id,
+            "is_paused": False,
+        },
+    )
     db.commit()
     db.refresh(queue)
     return queue

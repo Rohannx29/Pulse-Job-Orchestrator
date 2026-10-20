@@ -44,10 +44,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@0b93645e9dc71a7c6b842877b39f9b71a6999a0d # v5.3.0
         with:
           python-version: "3.12"
           cache: "pip"
@@ -92,7 +92,7 @@ jobs:
           python -m pytest --cov=app --cov-report=xml --cov-report=term-missing -v backend/tests
 
       - name: Upload code coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
           name: backend-coverage-report
@@ -109,10 +109,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 20
           cache: "npm"
@@ -134,7 +134,7 @@ jobs:
           NEXT_PUBLIC_API_URL: http://localhost:8000
 
       - name: Upload Next.js build trace
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: success()
         with:
           name: nextjs-build-artifact
@@ -148,7 +148,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Validate docker-compose.yml configuration
         run: docker compose config --quiet
@@ -177,13 +177,16 @@ jobs:
           timeout 120 bash -c 'until curl -s -f http://localhost:8000/health > /dev/null; do sleep 3; echo "Waiting for API readiness..."; done'
           
           echo "Verifying API readiness probe:"
-          curl -s -f http://localhost:8000/health | grep '"status":"ok"'
+          curl -s -f http://localhost:8000/health | grep '"status":"healthy"'
           
           echo "Verifying API liveness probe:"
-          curl -s -f http://localhost:8000/health/live | grep '"status":"ok"'
+          curl -s -f http://localhost:8000/health/live | grep '"status":"alive"'
           
           echo "Verifying Next.js dashboard:"
           curl -s -f http://localhost:3000/ > /dev/null
+
+          echo "Verifying Next.js proxy to API health endpoint:"
+          curl -s -f http://localhost:3000/api/health | grep '"status":"healthy"'
 
       - name: Dump container logs on failure
         if: failure()
@@ -225,10 +228,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python 3.12 for API backend
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@0b93645e9dc71a7c6b842877b39f9b71a6999a0d # v5.3.0
         with:
           python-version: "3.12"
           cache: "pip"
@@ -264,7 +267,7 @@ jobs:
           echo "FastAPI backend is ready!"
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 20
           cache: "npm"
@@ -290,7 +293,7 @@ jobs:
           npm run test:e2e
 
       - name: Upload Playwright test report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
           name: playwright-e2e-report
@@ -320,19 +323,19 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up QEMU (multi-architecture emulation)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4480e82837421da421ba3f256dc1 # v3.2.0
         with:
           platforms: linux/amd64,linux/arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
       - name: Log in to GitHub Container Registry (GHCR)
         if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -340,7 +343,7 @@ jobs:
 
       - name: Extract Docker metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
         with:
           images: ghcr.io/${{ github.repository }}/${{ matrix.image-suffix }}
           tags: |
@@ -351,7 +354,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push multi-architecture image (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@4f58ea7960e230b9364c09257f41ceceac6c5f2b # v6.9.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -367,12 +370,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
       - name: Run Gitleaks secret scanner
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@774e286e11dd4f447dca09458097cf29a8a706be # v2.3.7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -392,13 +395,13 @@ jobs:
             file: ./frontend/Dockerfile
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
       - name: Build container image for security scan
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@4f58ea7960e230b9364c09257f41ceceac6c5f2b # v6.9.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -406,7 +409,7 @@ jobs:
           tags: pulse-${{ matrix.name }}:scan
 
       - name: Scan container image with Trivy (vulnerabilities)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # 0.29.0
         with:
           image-ref: pulse-${{ matrix.name }}:scan
           format: table
@@ -415,14 +418,14 @@ jobs:
           severity: CRITICAL,HIGH
 
       - name: Generate CycloneDX SBOM with Trivy
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # 0.29.0
         with:
           image-ref: pulse-${{ matrix.name }}:scan
           format: cyclonedx
           output: sbom-${{ matrix.name }}.cdx.json
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: sbom-${{ matrix.name }}
           path: sbom-${{ matrix.name }}.cdx.json

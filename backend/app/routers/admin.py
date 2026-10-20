@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -8,12 +9,15 @@ from app.models import (
     Job,
     Organization,
     OrganizationMember,
+    OutboxEvent,
+    OutboxStatus,
     Project,
     Queue,
     User,
     UserRole,
 )
-from app.schemas import AdminOrgOut, AdminStatsOut, AdminUserOut, UpdateUserRole
+from app.outbox import get_outbox_stats, replay_failed_outbox_event
+from app.schemas import AdminOrgOut, AdminStatsOut, AdminUserOut, OutboxEventOut, OutboxStatsOut, UpdateUserRole
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -103,5 +107,79 @@ def trigger_retention_prune(
     """Manually triggers data retention pruning across heartbeats, logs, executions, and terminal jobs."""
     from app.retention import run_retention_prune
     return run_retention_prune(db=db, user=admin)
+
+
+@router.get("/outbox/stats", response_model=OutboxStatsOut)
+def get_admin_outbox_stats(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_system_admin),
+):
+    """Retrieves operational backlog, oldest pending age, and failure stats for the transactional outbox."""
+    stats = get_outbox_stats(db)
+    return OutboxStatsOut(**stats)
+
+
+@router.get("/outbox/events", response_model=list[OutboxEventOut])
+def list_outbox_events(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_system_admin),
+    status: Optional[OutboxStatus] = Query(None, description="Filter by outbox status (PENDING, DISPATCHED, FAILED)"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Inspects outbox events across the platform with pagination and status filtering."""
+    q = db.query(OutboxEvent)
+    if status is not None:
+        q = q.filter(OutboxEvent.status == status)
+    return q.order_by(OutboxEvent.created_at.desc()).offset(offset).limit(limit).all()
+
+
+@router.post("/outbox/events/{event_id}/replay", response_model=OutboxEventOut)
+def replay_outbox_event(
+    event_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_system_admin),
+):
+    """Idempotently replays a FAILED outbox event by resetting it to PENDING."""
+    event = replay_failed_outbox_event(db, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Outbox event not found")
+
+    from app.audit import log_audit_event
+    log_audit_event(
+        db=db,
+        action="outbox.replay",
+        resource_type="outbox_event",
+        resource_id=event.id,
+        user=admin,
+        org_id=None,
+        details={"event_type": event.event_type, "aggregate_id": event.aggregate_id},
+    )
+    db.commit()
+    return event
+
+
+@router.post("/webhooks/encrypt-secrets")
+def encrypt_existing_webhook_secrets(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_system_admin),
+    batch_size: int = Query(100, ge=1, le=1000),
+):
+    """Administrative command to migrate and encrypt legacy plaintext webhook secrets."""
+    from app.commands.encrypt_webhook_secrets import run_webhook_secret_encryption
+    from app.audit import log_audit_event
+
+    results = run_webhook_secret_encryption(db=db, batch_size=batch_size, dry_run=False)
+    log_audit_event(
+        db=db,
+        action="webhooks.encrypt_secrets",
+        resource_type="system",
+        resource_id="kms_migration",
+        user=admin,
+        org_id=None,
+        details=results,
+    )
+    db.commit()
+    return results
 
 

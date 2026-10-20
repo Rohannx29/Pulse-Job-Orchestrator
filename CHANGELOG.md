@@ -13,6 +13,7 @@ All notable changes to **Pulse** after the initial scaffold, grouped by implemen
 - [External Audit Response](#external-audit-response)
 - [Phase 3 — Cookie + Refresh-Token Authentication](#phase-3--cookie--refresh-token-authentication--partial)
 - [Phase 4 — Test Suite Verification Hardening](#phase-4--test-suite-verification-hardening)
+- [Safe Hardening Pass (Phases 0–5) — Comprehensive Verification](#safe-hardening-pass-phases-05--comprehensive-verification)
 - [Verification Summary](#verification-summary)
 
 ---
@@ -977,6 +978,56 @@ The test now tampers a character 5 positions from the end, inside the segment wh
 
 - 50,000-iteration fuzz test of the corrected method: 0 failures
 - 20 consecutive full-suite runs: all passed
+
+---
+
+# Safe Hardening Pass (Phases 0–5) — Comprehensive Verification
+
+A full repository audit and hardening pass was implemented and verified across 6 phases without breaking public API behavior, removing supported features, or introducing destructive schema operations.
+
+### Phase 0 — Baseline Verification & Supply Chain Remediation
+- Recorded clean baseline: full backend suite passed (100 passed, 11 live-service integration tests skipped).
+- Frontend audited: clean install (`npm ci`) with 0 vulnerabilities, TypeScript check (`tsc --noEmit`) clean, Next.js 16 production build succeeded.
+- Multi-environment Compose validation: `docker compose config --quiet` and `docker compose -f docker-compose.prod.yml config --quiet` verified valid.
+- Alembic migration reversibility: `alembic upgrade head -> downgrade base -> upgrade head` round-trip verified.
+
+### Phase 1 — Truly Transactional Outbox & Monotonic Generation Fencing
+- **Schema Migration**: Added Alembic migration `c4d5e6f7a8b9_add_dispatch_generation.py` adding `dispatch_generation` integer column (`server_default='1'`, `default=1`) with SQLite batch-alter fallback.
+- **Caller-Owned Session Discipline**: Completely refactored `backend/app/dispatch.py` to eliminate `SessionLocal()` and uncommitted publishes. Dispatch operations operate strictly within caller sessions (`db or object_session(job)`) and stage `OutboxEvent` records atomically.
+- **Monotonic Generation Fencing**: Jobs increment `dispatch_generation` monotonically on submission, retry, and DLQ re-enqueue (`job:dispatch:{id}:{generation}` fencing key). Celery workers enforce durable state guards rejecting mismatched or terminal tasks (`BLOCKED`, `COMPLETED`, `DEAD_LETTER`).
+- **Stranded Job Reconciliation**: Added `reconcile_stranded_jobs` in `app/outbox.py` detecting runnable jobs missing pending/dispatched outbox events.
+- **Verification**: Verified 10 concurrency, recovery, and fencing tests in `backend/tests/test_outbox_concurrency.py`.
+
+### Phase 2 — Post-Commit External Effects
+- **Outbox Staging Across State Mutators**: Replaced direct pre-commit `publish_event` and `deliver_webhook` with current-session `record_event_outbox` and `record_webhook_dispatch_outbox` in:
+  - Queue updates, pause, and resume (`app/routers/queues.py`)
+  - Schedule toggles (`app/routers/schedules.py`)
+  - Job status transitions: claimed, running, completed, failed, dead_letter (`app/tasks.py`)
+  - DAG cascading failure (`app/dag.py`)
+  - Webhook delivery staging (`app/webhooks.py`)
+- **Operator Observability & Replay**: Added RBAC-protected administrative endpoints: `GET /admin/outbox/stats`, `GET /admin/outbox/events`, `POST /admin/outbox/events/{id}/replay`.
+- **Metrics**: Added Prometheus gauges `pulse_outbox_pending_events`, `pulse_outbox_failed_events`, `pulse_outbox_oldest_pending_age_seconds`, and counter `pulse_outbox_reconciled_total`.
+- **Verification**: Verified transaction rollback test `test_transaction_rollback_emits_no_redis_or_webhook_events`.
+
+### Phase 3 — Release & Deployment Hardening
+- **CI Contract Alignment**: Corrected `.github/workflows/ci.yml` smoke test assertions to match actual endpoint contracts: `/health` (`"status":"healthy"`), `/health/live` (`"status":"alive"`), `/api/health` (`"status":"healthy"`).
+- **Frontend Production Proxying**: Configured server-only `INTERNAL_API_URL: http://api:8000` for Next.js production container rewrites; browser requests use relative `/api` paths with prefix deduplication.
+- **Trusted Proxy CIDRs in Uvicorn**: Replaced `--forwarded-allow-ips "*"` with specific private/loopback networks (`127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`).
+- **Verification**: Spoofed `X-Forwarded-For` from untrusted peers verified rejected in `test_spoofed_x_forwarded_for_from_untrusted_peer`.
+
+### Phase 4 — Perimeter, Cryptography & Network Security
+- **Pinned Cryptography Dependency**: Explicitly pinned `cryptography==43.0.3` in `backend/requirements.txt`.
+- **Mandatory Production Encryption Key**: Enforced distinct `WEBHOOK_ENCRYPTION_KEY` in non-dev startup; rejects missing key or key reuse with `SECRET_KEY`.
+- **Resumable Plaintext Secret Migration**: Implemented idempotent migration command `app.commands.encrypt_webhook_secrets` and administrative endpoint `POST /admin/webhooks/encrypt-secrets` to encrypt legacy plaintext secrets.
+- **DNS Rebinding Socket Transport**: Implemented `SafeSyncBackend` in `app/url_safety.py` connecting directly to validated public IPs and asserting `stream._sock.getpeername()` post-connect, closing TOCTOU DNS rebinding windows.
+- **CSRF Protection for Refresh Cookies**: Hardened `CSRFProtectionMiddleware` to enforce Origin/Referer verification on requests bearing `pulse_refresh_token` as well as `pulse_access_token`.
+- **SSE Security**: Added header (`X-SSE-Ticket`) and cookie (`pulse_sse_ticket`) ticket consumption with `Referrer-Policy: no-referrer` header.
+- **Verification**: 16/16 tests passing in `backend/tests/test_network_security.py` and 11/11 in `backend/tests/test_webhook_rbac.py`.
+
+### Phase 5 — Operational Robustness, Retention Pruning & Supply Chain
+- **Automated Retention Pruning**: Expanded `app/retention.py` to prune dispatched outbox events (`OutboxStatus.DISPATCHED` after 14 days) and historical webhook deliveries (after 30 days) in bounded batches (1,000 rows/batch) with Prometheus telemetry (`pulse_pruned_rows_total`) and audit logging.
+- **Immutable GitHub Actions Pinning**: Pinned all 23 action steps in `.github/workflows/ci.yml` to immutable commit SHAs with semantic version comments.
+- **Full Suite Verification**: Verified 123 tests: 112 passed, 11 skipped (requiring live database), 0 failed in 89.44s.
 
 ---
 

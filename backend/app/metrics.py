@@ -319,6 +319,27 @@ pulse_webhook_delivery_duration_seconds = registry.register(
     )
 )
 
+# Transactional Outbox Metrics
+pulse_outbox_events_total = registry.register(
+    Counter(
+        "pulse_outbox_events_total",
+        "Total outbox events recorded partitioned by event_type",
+        ["event_type"],
+    )
+)
+pulse_outbox_pending_events = registry.register(
+    Gauge("pulse_outbox_pending_events", "Current count of outbox events pending dispatch")
+)
+pulse_outbox_failed_events = registry.register(
+    Gauge("pulse_outbox_failed_events", "Current count of permanently failed outbox events")
+)
+pulse_outbox_oldest_pending_age_seconds = registry.register(
+    Gauge("pulse_outbox_oldest_pending_age_seconds", "Age of the oldest pending outbox event in seconds")
+)
+pulse_outbox_reconciled_total = registry.register(
+    Counter("pulse_outbox_reconciled_total", "Total stranded jobs reconciled and staged to outbox")
+)
+
 
 # ---------- Metric Recording Helpers ----------
 
@@ -475,6 +496,32 @@ def collect_dynamic_metrics(db: Optional[Session] = None) -> None:
         inactive_sched = db.query(func.count(JobSchedule.id)).filter(JobSchedule.is_active == False).scalar() or 0
         pulse_job_schedules_total.set(float(active_sched), state="active")
         pulse_job_schedules_total.set(float(inactive_sched), state="inactive")
+
+        # Outbox gauges
+        from app.models import OutboxEvent, OutboxStatus
+        pending_outbox = db.query(func.count(OutboxEvent.id)).filter(OutboxEvent.status == OutboxStatus.PENDING).scalar() or 0
+        failed_outbox = db.query(func.count(OutboxEvent.id)).filter(OutboxEvent.status == OutboxStatus.FAILED).scalar() or 0
+        pulse_outbox_pending_events.set(float(pending_outbox))
+        pulse_outbox_failed_events.set(float(failed_outbox))
+
+        oldest_pending_row = (
+            db.query(OutboxEvent.created_at)
+            .filter(OutboxEvent.status == OutboxStatus.PENDING)
+            .order_by(OutboxEvent.created_at.asc())
+            .first()
+        )
+        if oldest_pending_row and oldest_pending_row[0]:
+            try:
+                now_dt = datetime.now(timezone.utc)
+                created = oldest_pending_row[0]
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age = max(0.0, (now_dt - created).total_seconds())
+                pulse_outbox_oldest_pending_age_seconds.set(age)
+            except Exception:
+                pulse_outbox_oldest_pending_age_seconds.set(0.0)
+        else:
+            pulse_outbox_oldest_pending_age_seconds.set(0.0)
 
     except Exception as exc:
         logger.warning("Metrics scrape: Error collecting table aggregates: %s", exc)

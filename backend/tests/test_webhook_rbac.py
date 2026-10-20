@@ -558,3 +558,73 @@ def test_centralized_invitations_and_audit(memory_db, org_and_users):
 
     finally:
         app.dependency_overrides.clear()
+
+
+def test_webhook_encryption_key_required_in_non_dev():
+    """Proves that non-development startup strictly requires a separate valid WEBHOOK_ENCRYPTION_KEY,
+    and forbids falling back to or reusing application SECRET_KEY."""
+    from app.config import settings
+
+    # Case 1: Missing WEBHOOK_ENCRYPTION_KEY outside of dev raises RuntimeError
+    with patch.object(settings, "IS_DEV", False), \
+         patch.object(settings, "WEBHOOK_ENCRYPTION_KEY", None):
+        with pytest.raises(RuntimeError, match="WEBHOOK_ENCRYPTION_KEY must be configured"):
+            from app.kms import _derive_fernet_key
+            _derive_fernet_key()
+
+    # Case 2: In development/test mode, fallback derivation is permitted
+    with patch.object(settings, "IS_DEV", True), \
+         patch.object(settings, "WEBHOOK_ENCRYPTION_KEY", None):
+        from app.kms import _derive_fernet_key
+        key = _derive_fernet_key()
+        assert len(key) == 44  # Valid 32-byte urlsafe base64
+
+
+def test_encrypt_webhook_secrets_migration_command(memory_db, org_and_users):
+    """Proves the resumable, idempotent data migration command encrypts legacy plaintext secrets."""
+    from app.commands.encrypt_webhook_secrets import run_webhook_secret_encryption
+    from app.kms import ENCRYPTION_PREFIX, decrypt_webhook_secret
+
+    org = org_and_users["org_a"]
+
+    # Insert two legacy plaintext webhook subscriptions
+    sub1 = WebhookSubscription(
+        id=str(uuid.uuid4()),
+        org_id=org.id,
+        url="https://client-a.com/webhook",
+        secret="whsec_plaintext_secret_number_one",
+        is_active=True,
+    )
+    sub2 = WebhookSubscription(
+        id=str(uuid.uuid4()),
+        org_id=org.id,
+        url="https://client-b.com/webhook",
+        secret="whsec_plaintext_secret_number_two",
+        previous_secret="whsec_old_plaintext_secret",
+        is_active=True,
+    )
+    memory_db.add_all([sub1, sub2])
+    memory_db.commit()
+
+    # 1. Run migration command
+    res1 = run_webhook_secret_encryption(memory_db, batch_size=10, dry_run=False)
+    assert res1["migrated"] == 2
+    assert res1["status"] == "completed"
+
+    memory_db.refresh(sub1)
+    memory_db.refresh(sub2)
+
+    # Both are now encrypted
+    assert sub1.secret.startswith(ENCRYPTION_PREFIX)
+    assert sub2.secret.startswith(ENCRYPTION_PREFIX)
+    assert sub2.previous_secret.startswith(ENCRYPTION_PREFIX)
+
+    # Decryption recovers the original plaintext secrets
+    assert decrypt_webhook_secret(sub1.secret) == "whsec_plaintext_secret_number_one"
+    assert decrypt_webhook_secret(sub2.secret) == "whsec_plaintext_secret_number_two"
+    assert decrypt_webhook_secret(sub2.previous_secret) == "whsec_old_plaintext_secret"
+
+    # 2. Idempotence: re-running does 0 migrations and reports up_to_date
+    res2 = run_webhook_secret_encryption(memory_db, batch_size=10, dry_run=False)
+    assert res2["migrated"] == 0
+    assert res2["status"] == "up_to_date"

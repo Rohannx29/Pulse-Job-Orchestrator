@@ -502,3 +502,28 @@ class WebhookTestResponse(BaseModel):
     duration_ms: Optional[float] = None
 
 
+# ---------- Outbox ----------
+
+class OutboxEventOut(BaseModel):
+    id: str
+    event_type: str
+    aggregate_type: str
+    aggregate_id: str
+    payload: dict[str, Any]
+    status: str
+    fencing_key: Optional[str] = None
+    retry_count: int
+    last_error: Optional[str] = None
+    created_at: datetime
+    published_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OutboxStatsOut(BaseModel):
+    pending_count: int
+    failed_count: int
+    oldest_pending_age_seconds: Optional[float] = None
+
+
+

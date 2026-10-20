@@ -39,7 +39,14 @@ def _derive_fernet_key() -> bytes:
             # Derive 32-byte key via SHA-256
             return base64.urlsafe_b64encode(hashlib.sha256(key_str.encode("utf-8")).digest())
 
-    # Fallback: derive deterministically from application SECRET_KEY
+    # Non-development environments MUST supply a separate WEBHOOK_ENCRYPTION_KEY
+    if not settings.IS_DEV:
+        raise RuntimeError(
+            "WEBHOOK_ENCRYPTION_KEY must be configured in non-development environments. "
+            "Do not fall back to SECRET_KEY."
+        )
+
+    # Fallback: derive deterministically from application SECRET_KEY (development/test mode only)
     secret_bytes = settings.SECRET_KEY.encode("utf-8")
     return base64.urlsafe_b64encode(hashlib.sha256(b"pulse-kms-webhook-v1:" + secret_bytes).digest())
 
@@ -74,6 +81,11 @@ def decrypt_webhook_secret(secret_cipher: str) -> str:
     if not secret_cipher:
         return secret_cipher
     if not secret_cipher.startswith(ENCRYPTION_PREFIX):
+        logger.warning(
+            "Accessing legacy unencrypted webhook secret. Plaintext secrets are deprecated "
+            "and will be rejected after the migration window. Run the data migration command "
+            "('python -m app.commands.encrypt_webhook_secrets') to encrypt existing secrets at rest."
+        )
         return secret_cipher
 
     token = secret_cipher[len(ENCRYPTION_PREFIX):]

@@ -48,6 +48,9 @@
 38. [End-to-end browser testing with Playwright and synthetic operator journeys](#38-end-to-end-browser-testing-with-playwright-and-synthetic-operator-journeys)
 39. [Webhook signing secret security, KMS encryption at rest, dual-signing rotation, and centralized invitation service](#39-webhook-signing-secret-security-kms-encryption-at-rest-dual-signing-rotation-and-centralized-invitation-service)
 40. [Transactional Outbox pattern, atomic DAG fan-in resolution, and hardened schedule occurrence deduplication](#40-transactional-outbox-pattern-atomic-dag-fan-in-resolution-and-hardened-schedule-occurrence-deduplication)
+41. [Network and session security hardening, query-string JWT removal, single-use SSE connection tickets, trusted proxy client IP identity, defense-in-depth SSRF, and CSRF protection](#41-network-and-session-security-hardening-query-string-jwt-removal-single-use-sse-connection-tickets-trusted-proxy-client-ip-identity-defense-in-depth-ssrf-and-csrf-protection)
+42. [Data integrity boundaries, multi-tenant queue isolation, migration reversibility, compound indexing, and segmented production deployment topology](#42-data-integrity-boundaries-multi-tenant-queue-isolation-migration-reversibility-compound-indexing-and-segmented-production-deployment-topology)
+43. [Hardened transactional outbox with monotonic generation fencing, outer transaction boundaries, and DNS-rebinding socket peer verification](#43-hardened-transactional-outbox-with-monotonic-generation-fencing-outer-transaction-boundaries-and-dns-rebinding-socket-peer-verification)
 
 ---
 
@@ -1718,6 +1721,44 @@ Pulse introduces end-to-end data integrity guarantees, strict tenant boundary va
 
 ---
 
+## 43. Hardened transactional outbox with monotonic generation fencing, outer transaction boundaries, and DNS-rebinding socket peer verification
+
+### Decision
+
+Pulse strengthens the transactional outbox architecture, outer transaction commit boundaries, and egress network transport:
+
+1. **Monotonic Generation Fencing (`backend/alembic/versions/c4d5e6f7a8b9_add_dispatch_generation.py`, `app.models`, `app.outbox`)**:
+   - Replaced fragile retry-count-based fencing with an explicit, database-persisted monotonic integer column: `Job.dispatch_generation` (default `1`).
+   - Fencing keys are formatted deterministically as `job:dispatch:{job.id}:{generation}`.
+   - Initial submission, automatic backoff retry, terminal failure/DLQ entry, manual retry (`POST /jobs/{id}/retry`), and repeated manual retries atomically increment `dispatch_generation` in the *same* database transaction as the state transition.
+   - Tasks pass `dispatch_generation` in kwargs. Celery workers implement a durable state guard that queries PostgreSQL before execution and safely drops tasks if the durable database status is `BLOCKED`, `COMPLETED`, `DEAD_LETTER`, or if the persisted `dispatch_generation` does not match the task payload.
+
+2. **Caller-Owned Session Discipline (`app.dispatch`, `app.routers.jobs`, `app.dag`, `app.webhooks`)**:
+   - Eliminated internal `SessionLocal()` creation and immediate `session.commit()` inside dispatch helpers.
+   - `dispatch_job(job, db=db)` operates strictly on the caller's session (`session = db or object_session(job)`), staging `OutboxEvent` rows atomically alongside Job/Queue/DAG updates.
+   - Commit occurs strictly at the outer request or background task transaction boundary. A failed or aborted transaction rolls back both the state change and the outbox event, preventing phantom worker execution.
+
+3. **Idempotent Stranded Job Reconciliation & Admin Observability (`app.outbox`, `app.routers.admin`)**:
+   - Periodic reconciliation (`reconcile_stranded_jobs`) queries runnable jobs (`QUEUED` or `SCHEDULED`) missing pending/dispatched outbox events (e.g. following process crashes before staging completed) and safely restages them with audit logging and Prometheus counters (`pulse_outbox_reconciled_total`).
+   - RBAC-protected administrative endpoints (`GET /admin/outbox/stats`, `GET /admin/outbox/events`, `POST /admin/outbox/events/{id}/replay`) allow operators to observe backlog age, inspect failed events, and trigger idempotent replays.
+
+4. **DNS Rebinding Socket Peer Verification (`app.url_safety`)**:
+   - Custom HTTP transport backend `SafeSyncBackend` intercepts `httpcore` TCP connection streams.
+   - Beyond standard pre-resolution IP validation, the backend inspects the connected socket peer directly via `stream._sock.getpeername()`.
+   - If the remote server exploits a Time-Of-Check to Time-Of-Use (TOCTOU) DNS rebinding window by resolving to a public IP on DNS query but connecting to a loopback, private RFC 1918, or cloud metadata address (`169.254.169.254`), the socket is instantly closed with a `ValueError`, while preserving full TLS SNI host verification.
+
+5. **Mandatory Production Encryption Key & Resumable Secret Migration (`app.config`, `app.kms`, `app.commands.encrypt_webhook_secrets`)**:
+   - Non-development environments require a distinct `WEBHOOK_ENCRYPTION_KEY` and reject reuse of application `SECRET_KEY`.
+   - Administrative CLI (`python -m app.commands.encrypt_webhook_secrets`) and API (`POST /admin/webhooks/encrypt-secrets`) provide an idempotent, chunked data migration that encrypts existing plaintext webhook signing secrets at rest.
+
+### Why
+
+1. **Eliminating Race-Induced Double Dispatch**: When a worker dies midway through execution or when a job is repeatedly retried from DLQ, previous fencing keys could collide or allow duplicate task execution. Monotonic generations guarantee an unambiguous ordering and drop stale tasks.
+2. **True Transactional Outbox Guarantees**: Dispatching or committing inside a nested library function breaks the transactional boundary of caller operations. Enforcing single outer commit guarantees all external effects are strictly post-commit.
+3. **Closing the DNS Rebinding TOCTOU Gap**: Standard pre-flight hostname resolution leaves a window where a malicious DNS server can return a public IP for validation and a private/metadata IP for the TCP connect. Socket peer inspection closes this vulnerability at the transport layer.
+
+---
+
 ## Decision summary
 
 | Area | Chosen approach | Main reason |
@@ -1754,6 +1795,7 @@ Pulse introduces end-to-end data integrity guarantees, strict tenant boundary va
 | Data integrity & production topology | Cross-tenant retry checks + 256KB caps + keyset cursor pagination + named FK migrations + segmented prod compose | Guarantees multi-tenant isolation, constant-time pagination, reversible migrations, zero exposed DB ports, and automated backups |
 | CI/CD & multi-arch delivery | GitHub Actions + ephemeral services + Buildx QEMU | Automated verification across PostgreSQL 16 & Redis 7 with AMD64/ARM64 container images |
 | End-to-end browser testing | Playwright + isolated browser contexts + Next.js webServer | Real browser verification of auth cookies, queue controls, DAG graphs, and webhooks |
+| Monotonic generation fencing & DNS rebinding backend | Integer `dispatch_generation` + caller-owned transactions + `SafeSyncBackend` peer checking | Eliminates DLQ/retry double dispatch races, prevents uncommitted publishes, and stops TOCTOU DNS rebinding |
 
 ---
 

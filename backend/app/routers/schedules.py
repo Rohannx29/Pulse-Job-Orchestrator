@@ -60,11 +60,16 @@ def toggle_schedule(schedule_id: str, db: Session = Depends(get_db), user: User 
         org_id=schedule.queue.project.org_id,
         details={"schedule_name": schedule.name, "is_active": schedule.is_active},
     )
-    from app.events import publish_event
-    publish_event(schedule.queue.project.org_id, "schedule.toggled", {
-        "schedule_id": schedule.id,
-        "is_active": schedule.is_active,
-    })
+    from app.outbox import record_event_outbox
+    record_event_outbox(
+        db,
+        schedule.queue.project.org_id,
+        "schedule.toggled",
+        {
+            "schedule_id": schedule.id,
+            "is_active": schedule.is_active,
+        },
+    )
     db.commit()
     db.refresh(schedule)
     return schedule

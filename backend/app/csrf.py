@@ -25,9 +25,12 @@ class CSRFProtectionMiddleware(BaseHTTPMiddleware):
         if request.method in SAFE_METHODS:
             return await call_next(request)
 
-        # Check if cookie authentication is present on this request
-        cookie_token = request.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME)
-        if not cookie_token:
+        # Check if browser cookie authentication (access token OR refresh token) is present
+        has_auth_cookie = bool(
+            request.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME)
+            or request.cookies.get(settings.REFRESH_TOKEN_COOKIE_NAME)
+        )
+        if not has_auth_cookie:
             # Not authenticated via cookies (e.g. pure Bearer token or unauthenticated auth routes)
             return await call_next(request)
 

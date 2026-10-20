@@ -185,13 +185,22 @@ def test_dispatch_webhooks_for_event(memory_db):
     memory_db.add_all([sub1, sub2, sub3, sub_inactive, sub_other_org])
     memory_db.commit()
 
-    with patch("app.tasks.deliver_webhook.apply_async") as mock_apply:
-        # Event: job.completed
-        ids = dispatch_webhooks_for_event(memory_db, org1_id, "job.completed", {"id": "1"})
-        # Should match sub1 (wildcard) and sub3 (exact), NOT sub2, sub_inactive, or sub_other_org
-        assert len(ids) == 2
-        assert mock_apply.call_count == 2
-        for call in mock_apply.call_args_list:
+    # Event: job.completed
+    ids = dispatch_webhooks_for_event(memory_db, org1_id, "job.completed", {"id": "1"})
+    # Should match sub1 (wildcard) and sub3 (exact), NOT sub2, sub_inactive, or sub_other_org
+    assert len(ids) == 2
+
+    # 2 outbox events recorded atomically for transactional delivery
+    from app.models import OutboxEvent
+    outbox_events = memory_db.query(OutboxEvent).filter(OutboxEvent.aggregate_id.in_(ids)).all()
+    assert len(outbox_events) == 2
+
+    with patch("app.celery_app.celery_app.send_task") as mock_send:
+        from app.outbox import publish_pending_outbox_events
+        publish_pending_outbox_events(memory_db)
+        assert mock_send.call_count == 2
+        for call in mock_send.call_args_list:
+            assert call[1]["name"] == "app.tasks.deliver_webhook"
             assert call[1]["queue"] == "pulse.internal"
 
 

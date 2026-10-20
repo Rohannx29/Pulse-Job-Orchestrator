@@ -147,6 +147,36 @@ def test_sse_ticket_lifecycle(client, test_user):
     assert res_replay.status_code == 401
 
 
+def test_sse_ticket_via_header_and_cookie(client, test_user):
+    token = create_access_token(subject=test_user.id)
+    client.cookies.set(settings.ACCESS_TOKEN_COOKIE_NAME, token)
+
+    # 1. Ticket via X-SSE-Ticket header
+    res = client.post("/auth/sse-ticket", headers={"Origin": "http://localhost:3000"})
+    assert res.status_code == 200
+    ticket_header = res.json()["ticket"]
+
+    client.cookies.clear()
+    with client.stream("GET", "/events", headers={"X-SSE-Ticket": ticket_header}) as stream_res:
+        assert stream_res.status_code == 200
+        assert stream_res.headers.get("referrer-policy") == "no-referrer"
+
+    # Replay with header fails
+    res_replay = client.get("/events", headers={"X-SSE-Ticket": ticket_header})
+    assert res_replay.status_code == 401
+
+    # 2. Ticket via pulse_sse_ticket cookie
+    client.cookies.set(settings.ACCESS_TOKEN_COOKIE_NAME, token)
+    res2 = client.post("/auth/sse-ticket", headers={"Origin": "http://localhost:3000"})
+    ticket_cookie = res2.json()["ticket"]
+
+    client.cookies.clear()
+    client.cookies.set("pulse_sse_ticket", ticket_cookie)
+    with client.stream("GET", "/events") as stream_res2:
+        assert stream_res2.status_code == 200
+        assert stream_res2.headers.get("referrer-policy") == "no-referrer"
+
+
 
 
 # ============================================================================
@@ -175,6 +205,23 @@ def test_client_ip_from_trusted_proxy():
         resolved_ip = get_client_ip(req)
         # Real client IP from leftmost untrusted header entry
         assert resolved_ip == "203.0.113.195"
+
+
+def test_spoofed_x_forwarded_for_from_untrusted_peer():
+    """Explicitly tests that when an untrusted peer sends a spoofed X-Forwarded-For header,
+    the application ignores the header and resolves the direct socket peer IP."""
+    req = MagicMock()
+    req.client.host = "203.0.113.50"  # Untrusted external IP
+    req.headers = Headers({
+        "X-Forwarded-For": "127.0.0.1, 10.0.0.1",
+        "X-Real-IP": "127.0.0.1",
+    })
+
+    with patch.object(settings, "TRUSTED_PROXIES", ["127.0.0.1", "172.16.0.0/12"]):
+        assert not is_trusted_proxy("203.0.113.50")
+        client_ip = get_client_ip(req)
+        # MUST resolve to direct peer 203.0.113.50, ignoring spoofed 127.0.0.1
+        assert client_ip == "203.0.113.50"
 
 
 # ============================================================================
@@ -281,6 +328,34 @@ def test_csrf_safe_methods_bypass(client, test_user):
     # Safe GET method with foreign origin is not blocked by CSRF
     res = client.get("/health/live", headers={"Origin": "https://external-monitor.com"})
     assert res.status_code == 200
+
+
+def test_csrf_refresh_token_cookie_enforcement(client):
+    # Set only the refresh token cookie
+    client.cookies.clear()
+    client.cookies.set(settings.REFRESH_TOKEN_COOKIE_NAME, "dummy-refresh-token")
+
+    # 1. POST /auth/refresh without Origin or Referer -> 403 Forbidden
+    res = client.post("/auth/refresh", headers={})
+    assert res.status_code == 403
+    assert "missing Origin/Referer" in res.json()["detail"]
+
+    # 2. POST /auth/refresh from untrusted Origin -> 403 Forbidden
+    res_untrusted = client.post(
+        "/auth/refresh",
+        headers={"Origin": "https://malicious-site.com"},
+    )
+    assert res_untrusted.status_code == 403
+    assert "untrusted origin" in res_untrusted.json()["detail"]
+
+    # 3. POST /auth/refresh with trusted Origin passes CSRF middleware
+    # (returns 401 because dummy token is invalid, but passes CSRF 403)
+    res_trusted = client.post(
+        "/auth/refresh",
+        headers={"Origin": "http://localhost:3000"},
+    )
+    assert res_trusted.status_code == 401
+    assert "invalid or expired" in res_trusted.json()["detail"].lower()
 
 
 

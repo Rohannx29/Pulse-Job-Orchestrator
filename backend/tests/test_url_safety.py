@@ -39,3 +39,26 @@ def test_allows_public_host():
 def test_rejects_unresolvable_hostname():
     with pytest.raises(ValueError, match="Could not resolve"):
         validate_public_url("http://this-domain-should-not-exist-pulse-test.invalid/")
+
+
+def test_dns_rebinding_socket_peer_blocked():
+    """Controlled DNS rebinding test:
+    Simulates a target where DNS pre-check returns a public IP, but when
+    the TCP socket connects, the remote peer IP is a loopback or metadata IP (rebinding).
+    SafeSyncBackend MUST detect the disallowed peer IP, close the socket, and raise ValueError."""
+    from unittest.mock import MagicMock, patch
+    from app.url_safety import SafeSyncBackend
+
+    backend = SafeSyncBackend()
+
+    mock_sock = MagicMock()
+    mock_sock.getpeername.return_value = ("169.254.169.254", 80)
+
+    mock_stream = MagicMock()
+    mock_stream._sock = mock_sock
+
+    with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 80))]), \
+         patch("httpcore.SyncBackend.connect_tcp", return_value=mock_stream):
+        with pytest.raises(ValueError, match="DNS rebinding attack blocked"):
+            backend.connect_tcp("rebind.attacker.com", 80)
+        assert mock_stream.close.called

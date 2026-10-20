@@ -2,7 +2,8 @@
 const nextConfig = {
   output: "standalone",
   async rewrites() {
-    const backendUrl = process.env.INTERNAL_API_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const defaultBackend = process.env.NODE_ENV === "production" ? "http://api:8000" : "http://localhost:8000";
+    const backendUrl = process.env.INTERNAL_API_URL || defaultBackend;
     return [
       {
         source: "/api/:path*",
