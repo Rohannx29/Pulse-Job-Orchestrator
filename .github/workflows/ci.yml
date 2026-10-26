@@ -409,7 +409,7 @@ jobs:
           tags: pulse-${{ matrix.name }}:scan
 
       - name: Scan container image with Trivy (vulnerabilities)
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # 0.29.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: pulse-${{ matrix.name }}:scan
           format: table
@@ -418,7 +418,7 @@ jobs:
           severity: CRITICAL,HIGH
 
       - name: Generate CycloneDX SBOM with Trivy
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # 0.29.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: pulse-${{ matrix.name }}:scan
           format: cyclonedx
